@@ -29,10 +29,9 @@ no FFI, and no BCL-heavy code crosses that boundary.
 ## Build
 
 ```sh
-build/fable-gen.sh          # regenerate Rust + TS from F# (required after any F# change)
-cd daemon && cargo run -p temporald
-npx tsx build/m0-smoke.ts   # TS-side smoke
-dotnet test shared          # domain unit tests
+build/check.sh              # full gate: codegen, build, clippy, tests, parity, smokes
+build/fable-gen.sh          # just regenerate Rust + TS from F# (after any F# change)
+build/parity-test.sh        # just the three-way wire-format parity test
 ```
 
 Generated code (`daemon/crates/temporal-core/src/`, `ui/src/gen/`) is gitignored —

@@ -8,7 +8,7 @@ license.workspace = true
 
 [lib]
 name = "temporal_core"
-path = "src/Types.rs"
+path = "src/Lib.rs"
 
 [dependencies]
 fable_library_rust.workspace = true

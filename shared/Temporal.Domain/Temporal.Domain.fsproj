@@ -3,6 +3,9 @@
     <RootNamespace>Temporal.Domain</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="Json.fs" />
     <Compile Include="Types.fs" />
+    <Compile Include="Codecs.fs" />
+    <Compile Include="Lib.fs" />
   </ItemGroup>
 </Project>

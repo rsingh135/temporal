@@ -16,6 +16,12 @@ dotnet fable shared/Temporal.Domain --lang rust -o daemon/crates/temporal-core/s
 echo "==> Temporal.Domain -> TypeScript (ui/src/gen/domain)"
 dotnet fable shared/Temporal.Domain --lang typescript -o ui/src/gen/domain
 
+echo "==> Temporal.Parity -> Rust (daemon/crates/temporal-parity/src)"
+dotnet fable shared/Temporal.Parity --lang rust -o daemon/crates/temporal-parity/src
+
+echo "==> Temporal.Parity -> TypeScript (ui/src/gen/parity)"
+dotnet fable shared/Temporal.Parity --lang typescript -o ui/src/gen/parity
+
 if [ -d shared/Temporal.UI ] && [ -f shared/Temporal.UI/Temporal.UI.fsproj ]; then
     echo "==> Temporal.UI -> TypeScript (ui/src/gen/ui)"
     dotnet fable shared/Temporal.UI --lang typescript -o ui/src/gen/ui

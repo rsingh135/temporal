@@ -1,0 +1,16 @@
+# Crate sources (src/*.rs) are GENERATED from shared/Temporal.Parity by
+# build/fable-gen.sh (includes the Temporal.Domain sources it references).
+[package]
+name = "temporal-parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "temporal-parity"
+path = "src/Program.rs"
+
+[dependencies]
+# Reuse temporal-core's generated runtime copy; the identical copy Fable drops
+# into this crate's own src/fable_modules is excluded at the workspace level.
+fable_library_rust.workspace = true

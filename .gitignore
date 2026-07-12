@@ -9,6 +9,7 @@ fable_modules/
 
 # Generated code (rebuilt by build/fable-gen.sh)
 daemon/crates/temporal-core/src/
+daemon/crates/temporal-parity/src/
 ui/src/gen/
 
 # Rust

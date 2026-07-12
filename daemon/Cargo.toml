@@ -2,7 +2,11 @@
 resolver = "2"
 members = [
     "crates/temporal-core",
+    "crates/temporal-parity",
     "crates/temporald",
+]
+exclude = [
+    "crates/temporal-parity/src/fable_modules/fable-library-rust",
 ]
 
 [workspace.package]

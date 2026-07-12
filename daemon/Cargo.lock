@@ -502,6 +502,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "temporal-parity"
+version = "0.1.0"
+dependencies = [
+ "fable_library_rust",
+]
+
+[[package]]
 name = "temporald"
 version = "0.1.0"
 dependencies = [
