@@ -4,6 +4,7 @@
 //! thread or AppKit. Bundle identity is resolved from process executable
 //! paths + Info.plist instead of NSRunningApplication for exactly that reason.
 
+pub mod ax;
 pub mod bundle;
 pub mod permissions;
 pub mod window_list;

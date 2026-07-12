@@ -288,6 +288,59 @@ impl DaemonHandler {
         Self::respond(&responder, IpcResponse::QueryResults(list)).await;
     }
 
+    async fn handle_rehydrate(
+        &self,
+        payload: LrcPtr<temporal_core::Temporal::Domain::Types::RehydrationPayload>,
+        responder: Responder,
+    ) {
+        Self::respond(&responder, IpcResponse::RehydrateStarted).await;
+        // Exclusion filtering is shared F# logic (same code the UI runs).
+        let included = temporal_core::Temporal::Domain::Planning::includedNodes(
+            payload.Workspace.clone(),
+            payload.ExcludedNodeIds.clone(),
+        );
+        let nodes = crate::convert::from_nodes(included);
+        let total = nodes.len();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(32);
+        let work = tokio::task::spawn_blocking(move || {
+            temporal_adapters::rehydrate::rehydrate_nodes(&nodes, |i, label| {
+                let _ = tx.blocking_send((i, label.to_string()));
+            })
+        });
+        while let Some((i, label)) = rx.recv().await {
+            let percent = (i * 100).checked_div(total).unwrap_or(100) as i32;
+            Self::respond(
+                &responder,
+                IpcResponse::Progress(fromString("launch".into()), fromString(label), percent),
+            )
+            .await;
+        }
+        match work.await {
+            Ok(outcome) => {
+                let message = if outcome.failures.is_empty() {
+                    format!("rehydrated {} windows", outcome.restored)
+                } else {
+                    format!(
+                        "rehydrated {} windows; {} failed: {}",
+                        outcome.restored,
+                        outcome.failures.len(),
+                        outcome.failures.join("; ")
+                    )
+                };
+                info!(restored = outcome.restored, failures = outcome.failures.len(), "rehydration finished");
+                Self::respond(&responder, IpcResponse::Done(fromString(message))).await;
+            }
+            Err(join_err) => {
+                Self::respond(
+                    &responder,
+                    IpcResponse::IpcError(fromString("E_INTERNAL".into()), fromString(join_err.to_string())),
+                )
+                .await;
+            }
+        }
+    }
+
     async fn handle_request(&self, request_json: String, responder: Responder) {
         let request = match requestFromWire(fromString(request_json)) {
             Ok(request) => request,
@@ -306,15 +359,8 @@ impl DaemonHandler {
             IpcRequest::Query(text, limit) => {
                 self.handle_query(text.to_string(), *limit, responder).await
             }
-            IpcRequest::Rehydrate(_payload) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(
-                        fromString("E_NOT_IMPLEMENTED".into()),
-                        fromString("rehydration lands in M6".into()),
-                    ),
-                )
-                .await;
+            IpcRequest::Rehydrate(payload) => {
+                self.handle_rehydrate(payload.clone(), responder).await;
             }
         }
     }

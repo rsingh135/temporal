@@ -75,6 +75,71 @@ fn to_window_node(node: ExtractedNode) -> LrcPtr<domain::WindowNode> {
     })
 }
 
+fn from_list<T: Clone + 'static>(list: List<T>) -> Vec<T> {
+    List_::toArray(list).get().clone()
+}
+
+fn from_payload(payload: &domain::NodePayload) -> Payload {
+    match payload {
+        domain::NodePayload::BrowserWindow(tabs, active) => Payload::Browser {
+            tabs: from_list(tabs.clone())
+                .into_iter()
+                .map(|t| temporal_adapters::BrowserTab {
+                    url: t.Url.to_string(),
+                    title: t.Title.to_string(),
+                })
+                .collect(),
+            active_tab_index: *active,
+        },
+        domain::NodePayload::TerminalWindow(tabs) => Payload::Terminal {
+            tabs: from_list(tabs.clone())
+                .into_iter()
+                .map(|t| temporal_adapters::TerminalTab {
+                    tty: t.Tty.to_string(),
+                    working_directory: t.WorkingDirectory.to_string(),
+                })
+                .collect(),
+        },
+        domain::NodePayload::EditorWindow(folder_path, open_files) => Payload::Editor {
+            folder_path: folder_path.to_string(),
+            open_files: from_list(open_files.clone()).into_iter().map(|s| s.to_string()).collect(),
+        },
+        domain::NodePayload::GenericWindow => Payload::Generic,
+    }
+}
+
+fn from_adapter_kind(kind: &domain::AdapterKind) -> AdapterKind {
+    match kind {
+        domain::AdapterKind::Chrome => AdapterKind::Chrome,
+        domain::AdapterKind::TerminalApp => AdapterKind::TerminalApp,
+        domain::AdapterKind::VSCode => AdapterKind::VSCode,
+        domain::AdapterKind::Cursor => AdapterKind::Cursor,
+        domain::AdapterKind::Generic => AdapterKind::Generic,
+    }
+}
+
+/// Domain nodes (already filtered by Planning::includedNodes) back to
+/// adapter DTOs for rehydration.
+pub fn from_nodes(nodes: List<LrcPtr<domain::WindowNode>>) -> Vec<ExtractedNode> {
+    from_list(nodes)
+        .into_iter()
+        .map(|n| ExtractedNode {
+            node_id: n.NodeId.to_string(),
+            bundle_id: n.BundleId.to_string(),
+            app_name: n.AppName.to_string(),
+            window_title: n.WindowTitle.to_string(),
+            geometry: temporal_adapters::Geometry {
+                x: n.Geometry.X,
+                y: n.Geometry.Y,
+                width: n.Geometry.Width,
+                height: n.Geometry.Height,
+            },
+            kind: from_adapter_kind(&n.Adapter),
+            payload: from_payload(&n.Payload),
+        })
+        .collect()
+}
+
 /// Untagged workspace (Summary/Tags empty); run it through the generated
 /// `Tagging::enrich` afterwards.
 pub fn to_workspace(

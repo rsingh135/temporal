@@ -6,6 +6,7 @@
 //! it inside `spawn_blocking`.
 
 mod chrome;
+pub mod rehydrate;
 mod editor;
 mod generic;
 mod osascript;
