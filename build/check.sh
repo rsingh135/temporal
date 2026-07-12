@@ -16,16 +16,16 @@ echo "==> cargo build (workspace, includes generated crates)"
 (cd daemon && cargo build --workspace)
 
 echo "==> cargo clippy (handwritten crates, strict)"
-(cd daemon && cargo clippy -p temporald --no-deps -- -D warnings)
+(cd daemon && cargo clippy -p temporald -p temporal-ipc -p temporal-storage --no-deps -- -D warnings)
+
+echo "==> cargo test"
+(cd daemon && cargo test --workspace --quiet)
 
 echo "==> dotnet test"
 dotnet test shared/Temporal.Domain.Tests/Temporal.Domain.Tests.fsproj -v q
 
 echo "==> parity"
 build/parity-test.sh
-
-echo "==> rust smoke"
-(cd daemon && cargo run -q -p temporald)
 
 echo "==> ts smoke"
 npx -y tsx build/m1-smoke.ts

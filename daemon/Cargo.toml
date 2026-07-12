@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ipc",
+    "crates/storage",
     "crates/temporal-core",
     "crates/temporal-parity",
     "crates/temporald",
@@ -15,7 +17,9 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-fable_library_rust = { path = "crates/temporal-core/src/fable_modules/fable-library-rust" }
+# "atomic" switches Lrc from Rc to Arc so generated domain values are Send/Sync
+# and can cross tokio task boundaries in the daemon.
+fable_library_rust = { path = "crates/temporal-core/src/fable_modules/fable-library-rust", features = ["atomic"] }
 temporal-core = { path = "crates/temporal-core" }
 
 [profile.release]

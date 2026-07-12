@@ -1,24 +1,76 @@
-use fable_library_rust::String_::string;
-use temporal_core::Temporal::Domain::Codecs::{workspaceFromWire, workspaceToWire};
+mod handler;
+mod probe;
 
-// M1 smoke: decode a canonical wire-format workspace through the Fable-generated
-// codec, re-encode it, and require byte-identical output.
-const FIXTURE: &str = r#"{"workspaceId":"ws-1","capturedAtUnixMs":1752300000000,"summary":"daemon work","tags":["rust","temporal"],"nodes":[{"nodeId":"n1","bundleId":"com.google.Chrome","appName":"Google Chrome","windowTitle":"Fable docs","geometry":{"x":0,"y":25,"width":1440,"height":875.5},"adapter":"chrome","payload":{"kind":"browser","tabs":[{"url":"https://fable.io","title":"Fable · docs"}],"activeTabIndex":0}}]}"#;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-fn main() {
-    match workspaceFromWire(string(FIXTURE)) {
-        Ok(workspace) => {
-            let out = workspaceToWire(workspace);
-            if out.to_string() == FIXTURE {
-                println!("temporald M1 smoke: codec roundtrip OK ({} bytes)", FIXTURE.len());
-            } else {
-                eprintln!("roundtrip mismatch:\n  in:  {FIXTURE}\n  out: {out}");
-                std::process::exit(1);
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use temporal_storage::Storage;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "temporald", about = "Temporal Workspace Engine daemon")]
+struct Cli {
+    /// Unix domain socket path (default: <app dir>/temporald.sock).
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the daemon (default).
+    Run {
+        /// SQLite database path (default: <app dir>/temporal.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Send a single request to a running daemon and print the responses.
+    Probe {
+        #[command(subcommand)]
+        command: probe::ProbeCommand,
+    },
+}
+
+fn app_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot resolve home directory")?;
+    Ok(home.join("Library/Application Support/temporald"))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = Cli::parse();
+    let app_dir = app_dir()?;
+    let socket_path = cli.socket.unwrap_or_else(|| app_dir.join("temporald.sock"));
+
+    match cli.command.unwrap_or(Command::Run { db: None }) {
+        Command::Run { db } => {
+            let db_path = db.unwrap_or_else(|| app_dir.join("temporal.db"));
+            std::fs::create_dir_all(&app_dir)?;
+            let storage = Arc::new(Storage::open(&db_path)?);
+            let handler = Arc::new(handler::DaemonHandler::new(storage));
+            info!(socket = %socket_path.display(), db = %db_path.display(), "temporald starting");
+
+            tokio::select! {
+                served = temporal_ipc::serve(&socket_path, handler) => {
+                    served.context("ipc server failed")?;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("shutting down");
+                }
             }
+            // Leave no stale socket behind on clean shutdown.
+            let _ = std::fs::remove_file(&socket_path);
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("decode failed: {e}");
-            std::process::exit(1);
-        }
+        Command::Probe { command } => probe::run_probe(&socket_path, command).await,
     }
 }
