@@ -1,0 +1,9 @@
+[package]
+name = "temporald"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+temporal-core.workspace = true
+fable_library_rust.workspace = true

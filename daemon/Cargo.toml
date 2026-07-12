@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/temporal-core",
+    "crates/temporald",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+fable_library_rust = { path = "crates/temporal-core/src/fable_modules/fable-library-rust" }
+temporal-core = { path = "crates/temporal-core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,27 @@
+# .NET
+bin/
+obj/
+*.user
+
+# Fable
+fable_modules/
+.fable/
+
+# Generated code (rebuilt by build/fable-gen.sh)
+daemon/crates/temporal-core/src/
+ui/src/gen/
+
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+
+# Models (downloaded at first run)
+models/*.onnx
+models/*.gguf
+models/*.json
+
+# macOS
+.DS_Store

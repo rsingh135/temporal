@@ -1,0 +1,14 @@
+# Crate root (src/*.rs) is GENERATED from shared/Temporal.Domain by build/fable-gen.sh.
+# Do not edit the generated sources; edit the F# and regenerate.
+[package]
+name = "temporal-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "temporal_core"
+path = "src/Types.rs"
+
+[dependencies]
+fable_library_rust.workspace = true

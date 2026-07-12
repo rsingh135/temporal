@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Temporal.Domain</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Types.fs" />
+  </ItemGroup>
+</Project>
