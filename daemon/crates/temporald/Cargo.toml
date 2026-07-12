@@ -9,6 +9,7 @@ temporal-core.workspace = true
 fable_library_rust.workspace = true
 temporal-ipc = { path = "../ipc" }
 temporal-storage = { path = "../storage" }
+temporal-adapters = { path = "../adapters" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

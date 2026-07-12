@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/ipc",
+    "crates/adapters",
+    "crates/macos-ffi",
     "crates/storage",
     "crates/temporal-core",
     "crates/temporal-parity",

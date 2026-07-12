@@ -6,6 +6,7 @@
     <Compile Include="Json.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="Codecs.fs" />
+    <Compile Include="Tagging.fs" />
     <Compile Include="Lib.fs" />
   </ItemGroup>
 </Project>

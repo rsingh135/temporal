@@ -12,6 +12,8 @@ use temporal_core::Temporal::Domain::Types::{IpcRequest, IpcResponse};
 use temporal_ipc::{read_frame, write_frame};
 use tokio::net::UnixStream;
 
+#[path = "../src/convert.rs"]
+mod convert;
 #[path = "../src/handler.rs"]
 mod handler;
 

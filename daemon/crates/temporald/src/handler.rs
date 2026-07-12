@@ -13,9 +13,20 @@ use fable_library_rust::String_::fromString;
 use temporal_core::Temporal::Domain::Codecs::{
     requestFromWire, responseToWire, workspaceFromWire, workspaceToWire,
 };
+use temporal_core::Temporal::Domain::Tagging::{
+    enrich as tagging_enrich_raw, tagsToWire as tagging_tags_to_wire_raw,
+};
 use temporal_core::Temporal::Domain::Types::{
     IpcRequest, IpcResponse, QueryCandidate, WorkspaceState,
 };
+
+fn tagging_enrich(w: LrcPtr<WorkspaceState>) -> LrcPtr<WorkspaceState> {
+    tagging_enrich_raw(w)
+}
+
+fn tagging_tags_to_wire(w: LrcPtr<WorkspaceState>) -> String {
+    tagging_tags_to_wire_raw(w).to_string()
+}
 use temporal_ipc::{Handler, Responder};
 use temporal_storage::{Storage, WorkspaceRecord};
 use tracing::{info, warn};
@@ -39,31 +50,63 @@ impl DaemonHandler {
     async fn handle_freeze(&self, responder: Responder) {
         let workspace_id = format!("ws-{}", uuid::Uuid::new_v4());
         let now_ms = unix_ms();
-        // Extraction adapters land in M3; freeze currently persists an empty
-        // workspace to exercise the storage path end-to-end.
-        let workspace = LrcPtr::new(WorkspaceState {
-            WorkspaceId: fromString(workspace_id.clone()),
-            CapturedAtUnixMs: now_ms,
-            Summary: fromString(String::new()),
-            Tags: List_::empty(),
-            Nodes: List_::empty(),
-        });
         Self::respond(&responder, IpcResponse::FreezeStarted(fromString(workspace_id.clone()))).await;
+        Self::respond(
+            &responder,
+            IpcResponse::Progress(fromString("extract".into()), fromString("desktop state".into()), 10),
+        )
+        .await;
 
+        let report = match tokio::task::spawn_blocking(temporal_adapters::extract_workspace).await {
+            Ok(report) => report,
+            Err(join_err) => {
+                Self::respond(
+                    &responder,
+                    IpcResponse::IpcError(fromString("E_INTERNAL".into()), fromString(join_err.to_string())),
+                )
+                .await;
+                return;
+            }
+        };
+        for warning in &report.warnings {
+            warn!(warning, "extraction warning");
+        }
+        let node_count = report.nodes.len();
+        Self::respond(
+            &responder,
+            IpcResponse::Progress(
+                fromString("tag".into()),
+                fromString(format!("{node_count} windows captured")),
+                60,
+            ),
+        )
+        .await;
+
+        let workspace = tagging_enrich(crate::convert::to_workspace(
+            workspace_id.clone(),
+            now_ms,
+            report.nodes,
+        ));
+
+        Self::respond(
+            &responder,
+            IpcResponse::Progress(fromString("persist".into()), fromString(String::new()), 90),
+        )
+        .await;
         let record = WorkspaceRecord {
             workspace_id: workspace_id.clone(),
             captured_at_unix_ms: now_ms,
-            summary: String::new(),
-            tags_json: "[]".to_string(),
+            summary: workspace.Summary.to_string(),
+            tags_json: tagging_tags_to_wire(workspace.clone()),
             payload_json: workspaceToWire(workspace).to_string(),
         };
         let storage = Arc::clone(&self.storage);
         let stored = tokio::task::spawn_blocking(move || storage.upsert_workspace(&record)).await;
         match stored {
             Ok(Ok(())) => {
-                info!(workspace_id, "workspace frozen");
+                info!(workspace_id, node_count, "workspace frozen");
                 Self::respond(&responder, IpcResponse::Done(fromString(format!(
-                    "froze workspace {workspace_id} (0 nodes; extraction adapters land in M3)"
+                    "froze workspace {workspace_id} ({node_count} windows)"
                 ))))
                 .await;
             }
