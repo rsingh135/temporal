@@ -94,3 +94,32 @@ let enrich (w: WorkspaceState) : WorkspaceState =
 /// The Tags list as canonical wire JSON (for the denormalized DB column).
 let tagsToWire (w: WorkspaceState) : string =
     print (JArray (List.map JString w.Tags))
+
+/// Applies LLM-generated summary/tags on top of the heuristics: the summary
+/// replaces (LLM output is richer), tags merge (heuristics keep recall).
+let applyLlmTags (summary: string) (llmTags: string list) (w: WorkspaceState) : WorkspaceState =
+    let newSummary = if summary = "" then w.Summary else summary
+    let merged =
+        distinct (w.Tags @ List.map (fun (t: string) -> t.ToLower()) llmTags)
+        |> List.truncate 32
+    { w with Summary = newSummary; Tags = merged }
+
+/// The text whose embedding represents this workspace in the vector index.
+/// Order matters: summary and tags first (highest signal), then window
+/// titles, project folders and tab titles/hosts.
+let embeddingText (w: WorkspaceState) : string =
+    let nodeText (n: WindowNode) : string list =
+        let payloadText =
+            match n.Payload with
+            | BrowserWindow (tabs, _) ->
+                tabs |> List.collect (fun t -> [ t.Title; urlHost t.Url ])
+            | TerminalWindow tabs ->
+                tabs |> List.map (fun t -> t.WorkingDirectory)
+            | EditorWindow (folderPath, openFiles) -> folderPath :: openFiles
+            | GenericWindow -> []
+        n.AppName :: n.WindowTitle :: payloadText
+    let parts =
+        (w.Summary :: w.Tags) @ List.collect nodeText w.Nodes
+        |> List.filter (fun s -> s <> "")
+        |> distinct
+    String.concat "\n" parts

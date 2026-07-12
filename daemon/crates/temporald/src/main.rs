@@ -57,7 +57,25 @@ async fn main() -> Result<()> {
             let db_path = db.unwrap_or_else(|| app_dir.join("temporal.db"));
             std::fs::create_dir_all(&app_dir)?;
             let storage = Arc::new(Storage::open(&db_path)?);
-            let handler = Arc::new(handler::DaemonHandler::new(storage));
+            let embedder = match temporal_semantic::Embedder::load(
+                &app_dir.join("models/bge-small-en-v1.5"),
+            ) {
+                Ok(embedder) => Some(Arc::new(std::sync::Mutex::new(embedder))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "semantic search disabled (recency fallback)");
+                    None
+                }
+            };
+            let tagger = match temporal_semantic::Tagger::load(
+                &app_dir.join("models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf"),
+            ) {
+                Ok(tagger) => Some(Arc::new(std::sync::Mutex::new(tagger))),
+                Err(e) => {
+                    tracing::warn!(error = %e, "llm tagging disabled (heuristic tags only)");
+                    None
+                }
+            };
+            let handler = Arc::new(handler::DaemonHandler::new(storage, embedder, tagger));
             info!(socket = %socket_path.display(), db = %db_path.display(), "temporald starting");
 
             tokio::select! {

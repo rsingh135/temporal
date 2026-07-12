@@ -7,7 +7,7 @@ use fable_library_rust::String_::fromString;
 use temporal_adapters::{AdapterKind, ExtractedNode, Payload};
 use temporal_core::Temporal::Domain::Types as domain;
 
-fn to_list<T: Clone + 'static>(items: Vec<T>) -> List<T> {
+pub fn to_list<T: Clone + 'static>(items: Vec<T>) -> List<T> {
     let mut list = List_::empty();
     for item in items.into_iter().rev() {
         list = List_::cons(item, list);

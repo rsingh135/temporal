@@ -33,7 +33,7 @@ async fn start_daemon() -> TestDaemon {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket_path = dir.path().join("t.sock");
     let storage = Arc::new(temporal_storage::Storage::open(&dir.path().join("t.db")).expect("db"));
-    let handler = Arc::new(handler::DaemonHandler::new(storage));
+    let handler = Arc::new(handler::DaemonHandler::new(storage, None, None));
     let server = {
         let socket_path = socket_path.clone();
         tokio::spawn(async move {

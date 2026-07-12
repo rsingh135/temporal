@@ -4,6 +4,7 @@ members = [
     "crates/ipc",
     "crates/adapters",
     "crates/macos-ffi",
+    "crates/semantic",
     "crates/storage",
     "crates/temporal-core",
     "crates/temporal-parity",
