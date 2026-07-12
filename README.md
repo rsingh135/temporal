@@ -32,6 +32,23 @@ no FFI, and no BCL-heavy code crosses that boundary.
 build/check.sh              # full gate: codegen, build, clippy, tests, parity, smokes
 build/fable-gen.sh          # just regenerate Rust + TS from F# (after any F# change)
 build/parity-test.sh        # just the three-way wire-format parity test
+build/fetch-models.sh       # download the embedding + LLM models (pinned sha256)
+build/install-daemon.sh     # install temporald as a launchd LaunchAgent
+```
+
+## Run
+
+```sh
+# daemon (or install as LaunchAgent via build/install-daemon.sh)
+cd daemon && cargo run -p temporald
+
+# UI (dev): vite serves the frontend, the shell loads it; ⌥Space toggles the panel
+cd ui && npm run dev &          # dev server on :1420 (debug builds load this)
+./src-tauri/target/debug/temporal-ui
+
+# CLI probe (no UI needed)
+cd daemon && cargo run -p temporald -- probe freeze
+cd daemon && cargo run -p temporald -- probe query "that rust daemon work"
 ```
 
 Generated code (`daemon/crates/temporal-core/src/`, `ui/src/gen/`) is gitignored —

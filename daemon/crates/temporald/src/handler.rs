@@ -226,6 +226,14 @@ impl DaemonHandler {
         // otherwise, so the UI keeps working without the model download.
         let listed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(WorkspaceRecord, f64)>> {
             match embedder {
+                // An empty query means "show me recent workspaces", not
+                // "rank by similarity to the empty string".
+                Some(_) | None if text.trim().is_empty() => Ok(storage
+                    .list_workspaces()?
+                    .into_iter()
+                    .take(limit_n)
+                    .map(|r| (r, 0.0))
+                    .collect()),
                 Some(embedder) => {
                     let vector =
                         embedder.lock().expect("embedder mutex poisoned").embed_query(&text)?;

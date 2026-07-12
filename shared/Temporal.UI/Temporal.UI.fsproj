@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Temporal.UI</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Format.fs" />
+    <Compile Include="App.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Temporal.Domain/Temporal.Domain.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Fable.Core" Version="4.5.0" />
+    <PackageReference Include="Fable.Promise" Version="3.2.0" />
+    <PackageReference Include="Fable.Browser.Dom" Version="2.18.1" />
+    <PackageReference Include="Feliz" Version="3.3.3" />
+  </ItemGroup>
+</Project>

@@ -30,4 +30,8 @@ build/parity-test.sh
 echo "==> ts smoke"
 npx -y tsx build/m1-smoke.ts
 
+echo "==> ui build (vite + tauri shell)"
+(cd ui && npm run build)
+(cd ui/src-tauri && cargo build && cargo clippy --no-deps -- -D warnings)
+
 echo "ALL CHECKS PASSED"

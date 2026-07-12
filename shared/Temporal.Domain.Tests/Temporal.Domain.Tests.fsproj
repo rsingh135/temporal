@@ -6,6 +6,7 @@
     <Compile Include="JsonTests.fs" />
     <Compile Include="CodecTests.fs" />
     <Compile Include="TaggingTests.fs" />
+    <Compile Include="PlanningTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
