@@ -1,9 +1,10 @@
 //! Chrome adapter: windows, tabs, active tab and bounds via JXA.
 
 use serde::Deserialize;
+use temporal_domain::{AdapterKind, BrowserTab, NodePayload, WindowGeometry, WindowNode};
 
 use crate::osascript::run_jxa_json;
-use crate::{AdapterKind, BrowserTab, ExtractedNode, ExtractionReport, Geometry, Payload};
+use crate::ExtractionReport;
 
 const SCRIPT: &str = r#"
 const app = Application("Google Chrome");
@@ -51,15 +52,24 @@ pub fn extract(report: &mut ExtractionReport) {
         // AppleScript tab indices are 1-based; the wire format is 0-based.
         let active = (w.active_tab_index - 1).clamp(0, w.tabs.len() as i32 - 1);
         let window_title = w.tabs[active as usize].title.clone();
-        report.nodes.push(ExtractedNode {
+        report.nodes.push(WindowNode {
             node_id: String::new(),
             bundle_id: crate::CHROME_BUNDLE_ID.to_string(),
             app_name: "Google Chrome".to_string(),
             window_title,
-            geometry: Geometry { x: w.bounds.x, y: w.bounds.y, width: w.bounds.width, height: w.bounds.height },
-            kind: AdapterKind::Chrome,
-            payload: Payload::Browser {
-                tabs: w.tabs.into_iter().map(|t| BrowserTab { url: t.url, title: t.title }).collect(),
+            geometry: WindowGeometry {
+                x: w.bounds.x,
+                y: w.bounds.y,
+                width: w.bounds.width,
+                height: w.bounds.height,
+            },
+            adapter: AdapterKind::Chrome,
+            payload: NodePayload::Browser {
+                tabs: w
+                    .tabs
+                    .into_iter()
+                    .map(|t| BrowserTab { url: t.url, title: t.title })
+                    .collect(),
                 active_tab_index: active,
             },
         });

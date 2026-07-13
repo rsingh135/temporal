@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 temporal-macos-ffi = { path = "../macos-ffi" }
+temporal-domain = { path = "../domain" }
 # serde_json here parses osascript/storage.json TOOL OUTPUT only; the IPC/DB
 # wire format remains exclusively the shared F# codec.
 serde = { version = "1", features = ["derive"] }

@@ -1,19 +1,14 @@
 //! In-process end-to-end test of the daemon IPC surface: real UDS, real
-//! storage, real Fable-generated codec on both sides of the wire.
+//! storage, real serde wire codec on both sides.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fable_library_rust::List_;
-use fable_library_rust::Native_::LrcPtr;
-use fable_library_rust::String_::fromString;
-use temporal_core::Temporal::Domain::Codecs::{requestToWire, responseFromWire};
-use temporal_core::Temporal::Domain::Types::{IpcRequest, IpcResponse};
+use temporal_domain::wire::{request_to_wire, response_from_wire};
+use temporal_domain::{IpcRequest, IpcResponse};
 use temporal_ipc::{read_frame, write_frame};
 use tokio::net::UnixStream;
 
-#[path = "../src/convert.rs"]
-mod convert;
 #[path = "../src/handler.rs"]
 mod handler;
 
@@ -50,20 +45,19 @@ async fn start_daemon() -> TestDaemon {
     TestDaemon { socket_path, _dir: dir, server }
 }
 
-async fn roundtrip(stream: &mut UnixStream, request: IpcRequest) -> Vec<LrcPtr<IpcResponse>> {
-    let wire = requestToWire(LrcPtr::new(request)).to_string();
-    write_frame(stream, wire.as_bytes()).await.expect("write");
+async fn roundtrip(stream: &mut UnixStream, request: IpcRequest) -> Vec<IpcResponse> {
+    write_frame(stream, request_to_wire(&request).as_bytes()).await.expect("write");
     let mut responses = Vec::new();
     loop {
         let frame = read_frame(stream).await.expect("read").expect("frame");
         let json = String::from_utf8(frame).expect("utf8");
-        let response = responseFromWire(fromString(json)).expect("decode");
+        let response = response_from_wire(&json).expect("decode");
         let terminal = matches!(
-            response.as_ref(),
+            response,
             IpcResponse::Pong
-                | IpcResponse::Done(_)
-                | IpcResponse::IpcError(_, _)
-                | IpcResponse::QueryResults(_)
+                | IpcResponse::Done { .. }
+                | IpcResponse::Error { .. }
+                | IpcResponse::QueryResults { .. }
         );
         responses.push(response);
         if terminal {
@@ -79,32 +73,30 @@ async fn ping_freeze_query_flow() {
 
     // Ping
     let responses = roundtrip(&mut stream, IpcRequest::Ping).await;
-    assert!(matches!(responses.last().unwrap().as_ref(), IpcResponse::Pong));
+    assert!(matches!(responses.last().unwrap(), IpcResponse::Pong));
 
     // Freeze: FreezeStarted then Done, and the workspace must be persisted.
     let responses = roundtrip(&mut stream, IpcRequest::Freeze).await;
-    assert!(matches!(responses.first().unwrap().as_ref(), IpcResponse::FreezeStarted(_)));
-    assert!(matches!(responses.last().unwrap().as_ref(), IpcResponse::Done(_)));
+    assert!(matches!(responses.first().unwrap(), IpcResponse::FreezeStarted { .. }));
+    assert!(matches!(responses.last().unwrap(), IpcResponse::Done { .. }));
 
-    // Query: returns the single stored workspace, decoded through the codec.
-    let responses = roundtrip(&mut stream, IpcRequest::Query(fromString("anything".into()), 5)).await;
-    match responses.last().unwrap().as_ref() {
-        IpcResponse::QueryResults(candidates) => {
-            assert_eq!(List_::length(candidates.clone()), 1);
-        }
-        other => panic!("expected QueryResults, got {other}"),
+    // Query: returns the single stored workspace decoded through the codec.
+    let responses =
+        roundtrip(&mut stream, IpcRequest::Query { text: "anything".into(), limit: 5 }).await;
+    match responses.last().unwrap() {
+        IpcResponse::QueryResults { candidates } => assert_eq!(candidates.len(), 1),
+        other => panic!("expected QueryResults, got {other:?}"),
     }
 
     // Undecodable frame surfaces a codec error rather than killing the connection.
     write_frame(&mut stream, b"not json").await.expect("write");
     let frame = read_frame(&mut stream).await.expect("read").expect("frame");
     let json = String::from_utf8(frame).expect("utf8");
-    let response = responseFromWire(fromString(json)).expect("decode");
-    assert!(matches!(response.as_ref(), IpcResponse::IpcError(_, _)));
+    assert!(matches!(response_from_wire(&json).expect("decode"), IpcResponse::Error { .. }));
 
     // Connection still usable afterwards.
     let responses = roundtrip(&mut stream, IpcRequest::Ping).await;
-    assert!(matches!(responses.last().unwrap().as_ref(), IpcResponse::Pong));
+    assert!(matches!(responses.last().unwrap(), IpcResponse::Pong));
 }
 
 #[tokio::test]

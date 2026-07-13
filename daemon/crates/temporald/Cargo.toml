@@ -5,8 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-temporal-core.workspace = true
-fable_library_rust.workspace = true
+temporal-domain = { path = "../domain" }
 temporal-ipc = { path = "../ipc" }
 temporal-storage = { path = "../storage" }
 temporal-adapters = { path = "../adapters" }

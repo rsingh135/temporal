@@ -5,10 +5,11 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::Deserialize;
+use temporal_domain::{AdapterKind, NodePayload, TerminalTab, WindowGeometry, WindowNode};
 use tracing::debug;
 
 use crate::osascript::run_jxa_json;
-use crate::{AdapterKind, ExtractedNode, ExtractionReport, Geometry, Payload, TerminalTab};
+use crate::ExtractionReport;
 
 const SCRIPT: &str = r#"
 const app = Application("Terminal");
@@ -57,7 +58,7 @@ pub fn extract(report: &mut ExtractionReport) {
             if tab.selected {
                 selected_cwd = cwd.clone();
             }
-            tabs.push(TerminalTab { tty: tab.tty.clone(), working_directory: cwd });
+            tabs.push(TerminalTab { tty: tab.tty.clone(), cwd });
         }
         if tabs.is_empty() {
             continue;
@@ -66,14 +67,19 @@ pub fn extract(report: &mut ExtractionReport) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Terminal".to_string());
-        report.nodes.push(ExtractedNode {
+        report.nodes.push(WindowNode {
             node_id: String::new(),
             bundle_id: crate::TERMINAL_BUNDLE_ID.to_string(),
             app_name: "Terminal".to_string(),
             window_title,
-            geometry: Geometry { x: w.bounds.x, y: w.bounds.y, width: w.bounds.width, height: w.bounds.height },
-            kind: AdapterKind::TerminalApp,
-            payload: Payload::Terminal { tabs },
+            geometry: WindowGeometry {
+                x: w.bounds.x,
+                y: w.bounds.y,
+                width: w.bounds.width,
+                height: w.bounds.height,
+            },
+            adapter: AdapterKind::TerminalApp,
+            payload: NodePayload::Terminal { tabs },
         });
     }
 }

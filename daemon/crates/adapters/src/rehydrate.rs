@@ -12,10 +12,10 @@
 use std::process::Command;
 
 use serde_json::json;
+use temporal_domain::{BrowserTab, NodePayload, TerminalTab, WindowNode};
 use tracing::{info, warn};
 
 use crate::osascript::run_jxa_json;
-use crate::{ExtractedNode, Payload};
 
 /// Per-node outcome; failures don't abort the rest of the payload.
 pub struct RehydrationOutcome {
@@ -25,7 +25,7 @@ pub struct RehydrationOutcome {
 
 /// Rehydrates nodes in order, reporting progress (index, label) per node.
 pub fn rehydrate_nodes(
-    nodes: &[ExtractedNode],
+    nodes: &[WindowNode],
     mut progress: impl FnMut(usize, &str),
 ) -> RehydrationOutcome {
     let mut outcome = RehydrationOutcome { restored: 0, failures: Vec::new() };
@@ -45,20 +45,20 @@ pub fn rehydrate_nodes(
     outcome
 }
 
-fn rehydrate_node(node: &ExtractedNode) -> Result<(), String> {
+fn rehydrate_node(node: &WindowNode) -> Result<(), String> {
     match &node.payload {
-        Payload::Browser { tabs, active_tab_index } => {
+        NodePayload::Browser { tabs, active_tab_index } => {
             rehydrate_chrome(node, tabs, *active_tab_index)
         }
-        Payload::Terminal { tabs } => rehydrate_terminal(node, tabs),
-        Payload::Editor { folder_path, .. } => rehydrate_editor(node, folder_path),
-        Payload::Generic => rehydrate_generic(node),
+        NodePayload::Terminal { tabs } => rehydrate_terminal(node, tabs),
+        NodePayload::Editor { folder_path, .. } => rehydrate_editor(node, folder_path),
+        NodePayload::Generic => rehydrate_generic(node),
     }
 }
 
 fn rehydrate_chrome(
-    node: &ExtractedNode,
-    tabs: &[crate::BrowserTab],
+    node: &WindowNode,
+    tabs: &[BrowserTab],
     active_tab_index: i32,
 ) -> Result<(), String> {
     if tabs.is_empty() {
@@ -95,13 +95,13 @@ JSON.stringify("ok");
     Ok(())
 }
 
-fn rehydrate_terminal(node: &ExtractedNode, tabs: &[crate::TerminalTab]) -> Result<(), String> {
+fn rehydrate_terminal(node: &WindowNode, tabs: &[TerminalTab]) -> Result<(), String> {
     for tab in tabs {
-        if tab.working_directory.is_empty() {
+        if tab.cwd.is_empty() {
             continue;
         }
         let data = json!({
-            "cwd": tab.working_directory,
+            "cwd": tab.cwd,
             "bounds": {
                 "x": node.geometry.x,
                 "y": node.geometry.y,
@@ -127,7 +127,7 @@ JSON.stringify("ok");
     Ok(())
 }
 
-fn rehydrate_editor(node: &ExtractedNode, folder_path: &str) -> Result<(), String> {
+fn rehydrate_editor(node: &WindowNode, folder_path: &str) -> Result<(), String> {
     let status = Command::new("/usr/bin/open")
         .args(["-a", &node.app_name, folder_path])
         .status()
@@ -138,7 +138,7 @@ fn rehydrate_editor(node: &ExtractedNode, folder_path: &str) -> Result<(), Strin
     Ok(())
 }
 
-fn rehydrate_generic(node: &ExtractedNode) -> Result<(), String> {
+fn rehydrate_generic(node: &WindowNode) -> Result<(), String> {
     let status = Command::new("/usr/bin/open")
         .args(["-b", &node.bundle_id])
         .status()
@@ -147,19 +147,15 @@ fn rehydrate_generic(node: &ExtractedNode) -> Result<(), String> {
         return Err(format!("open -b {} exited with {status}", node.bundle_id));
     }
     // Geometry restore is best-effort and needs the Accessibility grant.
-    if node.geometry.width > 0.0 && temporal_macos_ffi::ax::is_trusted() {
-        if let Some(pid) = pid_for_bundle(&node.bundle_id) {
-            if temporal_macos_ffi::ax::wait_for_windows(pid, 1, std::time::Duration::from_secs(5)) {
-                let frame = (
-                    node.geometry.x,
-                    node.geometry.y,
-                    node.geometry.width,
-                    node.geometry.height,
-                );
-                if let Err(e) = temporal_macos_ffi::ax::place_windows(pid, &[frame]) {
-                    warn!(bundle = %node.bundle_id, error = %e, "window placement failed");
-                }
-            }
+    if node.geometry.width > 0.0
+        && temporal_macos_ffi::ax::is_trusted()
+        && let Some(pid) = pid_for_bundle(&node.bundle_id)
+        && temporal_macos_ffi::ax::wait_for_windows(pid, 1, std::time::Duration::from_secs(5))
+    {
+        let frame =
+            (node.geometry.x, node.geometry.y, node.geometry.width, node.geometry.height);
+        if let Err(e) = temporal_macos_ffi::ax::place_windows(pid, &[frame]) {
+            warn!(bundle = %node.bundle_id, error = %e, "window placement failed");
         }
     }
     Ok(())

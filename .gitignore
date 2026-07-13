@@ -1,19 +1,8 @@
-# .NET
-bin/
-obj/
-*.user
-
-# Fable
-fable_modules/
-.fable/
-
-# Generated code (rebuilt by build/fable-gen.sh)
-daemon/crates/temporal-core/src/
-daemon/crates/temporal-parity/src/
-ui/src/gen/
-
 # Rust
 target/
+
+# Generated TypeScript bindings (rebuilt by build/ts-gen.sh)
+ui/src/gen/
 
 # Node
 node_modules/

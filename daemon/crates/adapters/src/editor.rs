@@ -6,37 +6,38 @@ use std::path::{Path, PathBuf};
 
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
+use temporal_domain::{AdapterKind, NodePayload, WindowGeometry, WindowNode};
 
-use crate::{AdapterKind, ExtractedNode, ExtractionReport, Geometry, Payload};
+use crate::ExtractionReport;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Variant {
-    VSCode,
+    VsCode,
     Cursor,
 }
 
 impl Variant {
     fn bundle_id(self) -> &'static str {
         match self {
-            Variant::VSCode => crate::VSCODE_BUNDLE_ID,
+            Variant::VsCode => crate::VSCODE_BUNDLE_ID,
             Variant::Cursor => crate::CURSOR_BUNDLE_ID,
         }
     }
     fn app_name(self) -> &'static str {
         match self {
-            Variant::VSCode => "Visual Studio Code",
+            Variant::VsCode => "Visual Studio Code",
             Variant::Cursor => "Cursor",
         }
     }
     fn support_dir(self) -> &'static str {
         match self {
-            Variant::VSCode => "Code",
+            Variant::VsCode => "Code",
             Variant::Cursor => "Cursor",
         }
     }
     fn kind(self) -> AdapterKind {
         match self {
-            Variant::VSCode => AdapterKind::VSCode,
+            Variant::VsCode => AdapterKind::VsCode,
             Variant::Cursor => AdapterKind::Cursor,
         }
     }
@@ -87,7 +88,11 @@ fn extract_from_file(variant: Variant, storage_path: &Path, report: &mut Extract
     let raw = match std::fs::read_to_string(storage_path) {
         Ok(raw) => raw,
         Err(e) => {
-            report.warnings.push(format!("{}: cannot read {}: {e}", variant.app_name(), storage_path.display()));
+            report.warnings.push(format!(
+                "{}: cannot read {}: {e}",
+                variant.app_name(),
+                storage_path.display()
+            ));
             return;
         }
     };
@@ -110,7 +115,9 @@ fn extract_from_file(variant: Variant, storage_path: &Path, report: &mut Extract
     for w in windows {
         let Some(folder_uri) = &w.folder else { continue };
         let Some(folder_path) = file_uri_to_path(folder_uri) else {
-            report.warnings.push(format!("{}: unsupported folder URI {folder_uri}", variant.app_name()));
+            report
+                .warnings
+                .push(format!("{}: unsupported folder URI {folder_uri}", variant.app_name()));
             continue;
         };
         if !seen.insert(folder_path.clone()) {
@@ -119,7 +126,7 @@ fn extract_from_file(variant: Variant, storage_path: &Path, report: &mut Extract
         let geometry = w
             .ui_state
             .as_ref()
-            .map(|u| Geometry {
+            .map(|u| WindowGeometry {
                 x: u.x.unwrap_or(0.0),
                 y: u.y.unwrap_or(0.0),
                 width: u.width.unwrap_or(0.0),
@@ -130,14 +137,14 @@ fn extract_from_file(variant: Variant, storage_path: &Path, report: &mut Extract
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| folder_path.clone());
-        report.nodes.push(ExtractedNode {
+        report.nodes.push(WindowNode {
             node_id: String::new(),
             bundle_id: variant.bundle_id().to_string(),
             app_name: variant.app_name().to_string(),
             window_title,
             geometry,
-            kind: variant.kind(),
-            payload: Payload::Editor { folder_path, open_files: Vec::new() },
+            adapter: variant.kind(),
+            payload: NodePayload::Editor { folder_path, open_files: Vec::new() },
         });
     }
 }
@@ -167,7 +174,7 @@ mod tests {
         assert_eq!(node.window_title, "my repo");
         assert_eq!(node.geometry.width, 1280.0);
         match &node.payload {
-            Payload::Editor { folder_path, .. } => assert_eq!(folder_path, "/Users/dev/my repo"),
+            NodePayload::Editor { folder_path, .. } => assert_eq!(folder_path, "/Users/dev/my repo"),
             other => panic!("unexpected payload: {other:?}"),
         }
     }
@@ -182,7 +189,7 @@ mod tests {
         )
         .unwrap();
         let mut report = ExtractionReport::default();
-        extract_from_file(Variant::VSCode, &path, &mut report);
+        extract_from_file(Variant::VsCode, &path, &mut report);
         assert_eq!(report.nodes.len(), 2);
     }
 }

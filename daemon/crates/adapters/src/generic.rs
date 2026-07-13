@@ -3,9 +3,10 @@
 
 use std::collections::HashMap;
 
+use temporal_domain::{AdapterKind, NodePayload, WindowGeometry, WindowNode};
 use temporal_macos_ffi::{AppIdentity, WindowInfo};
 
-use crate::{AdapterKind, ExtractedNode, ExtractionReport, Geometry, Payload};
+use crate::ExtractionReport;
 
 /// Windows smaller than this are status items, tooltips or popovers.
 const MIN_WIDTH: f64 = 100.0;
@@ -29,15 +30,16 @@ pub fn extract(
         if consumed_bundle_ids.contains(&identity.bundle_id.as_str()) {
             continue;
         }
-        let window_title = if w.title.is_empty() { identity.app_name.clone() } else { w.title.clone() };
-        report.nodes.push(ExtractedNode {
+        let window_title =
+            if w.title.is_empty() { identity.app_name.clone() } else { w.title.clone() };
+        report.nodes.push(WindowNode {
             node_id: String::new(),
             bundle_id: identity.bundle_id.clone(),
             app_name: identity.app_name.clone(),
             window_title,
-            geometry: Geometry { x: w.x, y: w.y, width: w.width, height: w.height },
-            kind: AdapterKind::Generic,
-            payload: Payload::Generic,
+            geometry: WindowGeometry { x: w.x, y: w.y, width: w.width, height: w.height },
+            adapter: AdapterKind::Generic,
+            payload: NodePayload::Generic,
         });
     }
 }

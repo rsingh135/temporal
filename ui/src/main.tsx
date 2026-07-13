@@ -1,7 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
-import { App } from "./gen/ui/App";
+import { App } from "./App";
 import "./styles.css";
 
 // Webview console output is invisible in a headless launch; ferry errors to

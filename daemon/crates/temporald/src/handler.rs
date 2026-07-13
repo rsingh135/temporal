@@ -1,49 +1,17 @@
-//! Bridges IPC frames to the Fable-generated domain: decode request, run the
-//! daemon-side behavior, encode responses. All wire JSON comes from the shared
-//! F# codec — this file never hand-builds JSON.
+//! Bridges IPC frames to daemon behavior: decode request, act, encode
+//! responses. All wire JSON is serde over the shared domain types.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fable_library_rust::List_;
-use fable_library_rust::Native_::LrcPtr;
-use fable_library_rust::String_::fromString;
-use temporal_core::Temporal::Domain::Codecs::{
-    requestFromWire, responseToWire, workspaceFromWire, workspaceToWire,
+use temporal_domain::wire::{
+    request_from_wire, response_to_wire, tags_to_wire, workspace_from_wire, workspace_to_wire,
 };
-use temporal_core::Temporal::Domain::Tagging::{
-    applyLlmTags, embeddingText as tagging_embedding_text_raw, enrich as tagging_enrich_raw,
-    tagsToWire as tagging_tags_to_wire_raw,
+use temporal_domain::{
+    planning, tagging, IpcRequest, IpcResponse, QueryCandidate, RehydrationPayload, WorkspaceState,
 };
-use temporal_core::Temporal::Domain::Types::{
-    IpcRequest, IpcResponse, QueryCandidate, WorkspaceState,
-};
-
-fn tagging_enrich(w: LrcPtr<WorkspaceState>) -> LrcPtr<WorkspaceState> {
-    tagging_enrich_raw(w)
-}
-
-fn tagging_tags_to_wire(w: LrcPtr<WorkspaceState>) -> String {
-    tagging_tags_to_wire_raw(w).to_string()
-}
-
-fn tagging_embedding_text(w: LrcPtr<WorkspaceState>) -> String {
-    tagging_embedding_text_raw(w).to_string()
-}
-
-fn tagging_apply_llm(
-    summary: String,
-    tags: Vec<String>,
-    w: LrcPtr<WorkspaceState>,
-) -> LrcPtr<WorkspaceState> {
-    applyLlmTags(
-        fromString(summary),
-        crate::convert::to_list(tags.into_iter().map(fromString).collect()),
-        w,
-    )
-}
 use temporal_ipc::{Handler, Responder};
 use temporal_storage::{Storage, WorkspaceRecord};
 use tracing::{info, warn};
@@ -70,32 +38,37 @@ impl DaemonHandler {
     }
 
     async fn respond(responder: &Responder, response: IpcResponse) {
-        let wire = responseToWire(LrcPtr::new(response)).to_string();
-        if responder.send(wire).await.is_err() {
+        if responder.send(response_to_wire(&response)).await.is_err() {
             warn!("client went away mid-response");
         }
+    }
+
+    async fn error(responder: &Responder, code: &str, message: impl ToString) {
+        Self::respond(
+            responder,
+            IpcResponse::Error { code: code.to_string(), message: message.to_string() },
+        )
+        .await;
     }
 
     async fn handle_freeze(&self, responder: Responder) {
         let workspace_id = format!("ws-{}", uuid::Uuid::new_v4());
         let now_ms = unix_ms();
-        Self::respond(&responder, IpcResponse::FreezeStarted(fromString(workspace_id.clone()))).await;
+        Self::respond(&responder, IpcResponse::FreezeStarted { workspace_id: workspace_id.clone() })
+            .await;
         Self::respond(
             &responder,
-            IpcResponse::Progress(fromString("extract".into()), fromString("desktop state".into()), 10),
+            IpcResponse::Progress {
+                stage: "extract".into(),
+                detail: "desktop state".into(),
+                percent: 10,
+            },
         )
         .await;
 
         let report = match tokio::task::spawn_blocking(temporal_adapters::extract_workspace).await {
             Ok(report) => report,
-            Err(join_err) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(fromString("E_INTERNAL".into()), fromString(join_err.to_string())),
-                )
-                .await;
-                return;
-            }
+            Err(join_err) => return Self::error(&responder, "E_INTERNAL", join_err).await,
         };
         for warning in &report.warnings {
             warn!(warning, "extraction warning");
@@ -103,33 +76,35 @@ impl DaemonHandler {
         let node_count = report.nodes.len();
         Self::respond(
             &responder,
-            IpcResponse::Progress(
-                fromString("tag".into()),
-                fromString(format!("{node_count} windows captured")),
-                60,
-            ),
+            IpcResponse::Progress {
+                stage: "tag".into(),
+                detail: format!("{node_count} windows captured"),
+                percent: 60,
+            },
         )
         .await;
 
-        let workspace = tagging_enrich(crate::convert::to_workspace(
-            workspace_id.clone(),
-            now_ms,
-            report.nodes,
-        ));
+        let workspace = tagging::enrich(WorkspaceState {
+            workspace_id: workspace_id.clone(),
+            captured_at_unix_ms: now_ms,
+            summary: String::new(),
+            tags: Vec::new(),
+            nodes: report.nodes,
+        });
 
         Self::respond(
             &responder,
-            IpcResponse::Progress(fromString("persist".into()), fromString(String::new()), 90),
+            IpcResponse::Progress { stage: "persist".into(), detail: String::new(), percent: 90 },
         )
         .await;
         let record = WorkspaceRecord {
             workspace_id: workspace_id.clone(),
             captured_at_unix_ms: now_ms,
-            summary: workspace.Summary.to_string(),
-            tags_json: tagging_tags_to_wire(workspace.clone()),
-            payload_json: workspaceToWire(workspace.clone()).to_string(),
+            summary: workspace.summary.clone(),
+            tags_json: tags_to_wire(&workspace),
+            payload_json: workspace_to_wire(&workspace),
         };
-        let embedding_text = tagging_embedding_text(workspace);
+        let embedding_text = tagging::embedding_text(&workspace);
         let storage = Arc::clone(&self.storage);
         let embedder = self.embedder.clone();
         let id_for_store = workspace_id.clone();
@@ -148,32 +123,23 @@ impl DaemonHandler {
         match stored {
             Ok(Ok(())) => {
                 info!(workspace_id, node_count, "workspace frozen");
-                Self::respond(&responder, IpcResponse::Done(fromString(format!(
-                    "froze workspace {workspace_id} ({node_count} windows)"
-                ))))
+                Self::respond(
+                    &responder,
+                    IpcResponse::Done {
+                        message: format!("froze workspace {workspace_id} ({node_count} windows)"),
+                    },
+                )
                 .await;
                 // LLM enrichment runs after Done: the freeze stays instant and
                 // the record upgrades in place when generation finishes.
                 self.spawn_llm_enrichment(workspace_id);
             }
-            Ok(Err(e)) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(fromString("E_STORAGE".into()), fromString(e.to_string())),
-                )
-                .await;
-            }
-            Err(join_err) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(fromString("E_INTERNAL".into()), fromString(join_err.to_string())),
-                )
-                .await;
-            }
+            Ok(Err(e)) => Self::error(&responder, "E_STORAGE", e).await,
+            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
         }
     }
 
-    /// Detached: generate LLM summary/tags, merge via the shared F# logic,
+    /// Detached: generate LLM summary/tags, merge over the heuristics,
     /// re-persist and re-embed. Failures only log — heuristics remain.
     fn spawn_llm_enrichment(&self, workspace_id: String) {
         let Some(tagger) = self.tagger.clone() else { return };
@@ -184,30 +150,26 @@ impl DaemonHandler {
                 let Some(record) = storage.get_workspace(&workspace_id)? else {
                     return Ok(()); // deleted/overwritten in the meantime
                 };
-                let workspace = workspaceFromWire(fromString(record.payload_json.clone()))
+                let workspace = workspace_from_wire(&record.payload_json)
                     .map_err(|e| anyhow::anyhow!("stored payload undecodable: {e}"))?;
-                let context = tagging_embedding_text(workspace.clone());
+                let context = tagging::embedding_text(&workspace);
                 let result = tagger.lock().expect("tagger mutex poisoned").generate(&context)?;
                 info!(workspace_id, summary = %result.summary, tags = ?result.tags, "llm tags generated");
 
-                let enriched = tagging_apply_llm(
-                    result.summary,
-                    result.tags,
-                    workspace,
-                );
+                let enriched = tagging::apply_llm_tags(&result.summary, &result.tags, workspace);
                 let updated = WorkspaceRecord {
                     workspace_id: workspace_id.clone(),
                     captured_at_unix_ms: record.captured_at_unix_ms,
-                    summary: enriched.Summary.to_string(),
-                    tags_json: tagging_tags_to_wire(enriched.clone()),
-                    payload_json: workspaceToWire(enriched.clone()).to_string(),
+                    summary: enriched.summary.clone(),
+                    tags_json: tags_to_wire(&enriched),
+                    payload_json: workspace_to_wire(&enriched),
                 };
                 storage.upsert_workspace(&updated)?;
                 if let Some(embedder) = embedder {
                     let vector = embedder
                         .lock()
                         .expect("embedder mutex poisoned")
-                        .embed_document(&tagging_embedding_text(enriched))?;
+                        .embed_document(&tagging::embedding_text(&enriched))?;
                     storage.upsert_embedding(&workspace_id, &vector)?;
                 }
                 Ok(())
@@ -223,57 +185,40 @@ impl DaemonHandler {
         let embedder = self.embedder.clone();
         let limit_n = limit.max(0) as usize;
         // Semantic KNN when the model is available; recency order (score 0)
-        // otherwise, so the UI keeps working without the model download.
-        let listed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(WorkspaceRecord, f64)>> {
-            match embedder {
-                // An empty query means "show me recent workspaces", not
-                // "rank by similarity to the empty string".
-                Some(_) | None if text.trim().is_empty() => Ok(storage
-                    .list_workspaces()?
-                    .into_iter()
-                    .take(limit_n)
-                    .map(|r| (r, 0.0))
-                    .collect()),
-                Some(embedder) => {
-                    let vector =
-                        embedder.lock().expect("embedder mutex poisoned").embed_query(&text)?;
-                    Ok(storage.search_embeddings(&vector, limit_n)?)
+        // otherwise, and for empty queries ("show me recent workspaces").
+        let listed =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(WorkspaceRecord, f64)>> {
+                match embedder {
+                    Some(_) | None if text.trim().is_empty() => Ok(storage
+                        .list_workspaces()?
+                        .into_iter()
+                        .take(limit_n)
+                        .map(|r| (r, 0.0))
+                        .collect()),
+                    Some(embedder) => {
+                        let vector =
+                            embedder.lock().expect("embedder mutex poisoned").embed_query(&text)?;
+                        Ok(storage.search_embeddings(&vector, limit_n)?)
+                    }
+                    None => Ok(storage
+                        .list_workspaces()?
+                        .into_iter()
+                        .take(limit_n)
+                        .map(|r| (r, 0.0))
+                        .collect()),
                 }
-                None => Ok(storage
-                    .list_workspaces()?
-                    .into_iter()
-                    .take(limit_n)
-                    .map(|r| (r, 0.0))
-                    .collect()),
-            }
-        })
-        .await;
+            })
+            .await;
         let records = match listed {
             Ok(Ok(records)) => records,
-            Ok(Err(e)) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(fromString("E_STORAGE".into()), fromString(e.to_string())),
-                )
-                .await;
-                return;
-            }
-            Err(join_err) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(fromString("E_INTERNAL".into()), fromString(join_err.to_string())),
-                )
-                .await;
-                return;
-            }
+            Ok(Err(e)) => return Self::error(&responder, "E_STORAGE", e).await,
+            Err(join_err) => return Self::error(&responder, "E_INTERNAL", join_err).await,
         };
 
-        let mut candidates: Vec<LrcPtr<QueryCandidate>> = Vec::new();
+        let mut candidates = Vec::new();
         for (record, score) in records {
-            match workspaceFromWire(fromString(record.payload_json.clone())) {
-                Ok(workspace) => {
-                    candidates.push(LrcPtr::new(QueryCandidate { Workspace: workspace, Score: score }));
-                }
+            match workspace_from_wire(&record.payload_json) {
+                Ok(workspace) => candidates.push(QueryCandidate { workspace, score }),
                 Err(e) => {
                     // A payload we wrote that no longer decodes is a bug, not
                     // a user error; surface loudly but keep serving the rest.
@@ -281,25 +226,12 @@ impl DaemonHandler {
                 }
             }
         }
-        let mut list = List_::empty();
-        for candidate in candidates.into_iter().rev() {
-            list = List_::cons(candidate, list);
-        }
-        Self::respond(&responder, IpcResponse::QueryResults(list)).await;
+        Self::respond(&responder, IpcResponse::QueryResults { candidates }).await;
     }
 
-    async fn handle_rehydrate(
-        &self,
-        payload: LrcPtr<temporal_core::Temporal::Domain::Types::RehydrationPayload>,
-        responder: Responder,
-    ) {
+    async fn handle_rehydrate(&self, payload: RehydrationPayload, responder: Responder) {
         Self::respond(&responder, IpcResponse::RehydrateStarted).await;
-        // Exclusion filtering is shared F# logic (same code the UI runs).
-        let included = temporal_core::Temporal::Domain::Planning::includedNodes(
-            payload.Workspace.clone(),
-            payload.ExcludedNodeIds.clone(),
-        );
-        let nodes = crate::convert::from_nodes(included);
+        let nodes = planning::included_nodes(&payload.workspace, &payload.excluded_node_ids);
         let total = nodes.len();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(32);
@@ -312,7 +244,7 @@ impl DaemonHandler {
             let percent = (i * 100).checked_div(total).unwrap_or(100) as i32;
             Self::respond(
                 &responder,
-                IpcResponse::Progress(fromString("launch".into()), fromString(label), percent),
+                IpcResponse::Progress { stage: "launch".into(), detail: label, percent },
             )
             .await;
         }
@@ -329,39 +261,22 @@ impl DaemonHandler {
                     )
                 };
                 info!(restored = outcome.restored, failures = outcome.failures.len(), "rehydration finished");
-                Self::respond(&responder, IpcResponse::Done(fromString(message))).await;
+                Self::respond(&responder, IpcResponse::Done { message }).await;
             }
-            Err(join_err) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(fromString("E_INTERNAL".into()), fromString(join_err.to_string())),
-                )
-                .await;
-            }
+            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
         }
     }
 
     async fn handle_request(&self, request_json: String, responder: Responder) {
-        let request = match requestFromWire(fromString(request_json)) {
+        let request = match request_from_wire(&request_json) {
             Ok(request) => request,
-            Err(e) => {
-                Self::respond(
-                    &responder,
-                    IpcResponse::IpcError(fromString("E_DECODE".into()), fromString(e.to_string())),
-                )
-                .await;
-                return;
-            }
+            Err(e) => return Self::error(&responder, "E_DECODE", e).await,
         };
-        match request.as_ref() {
+        match request {
             IpcRequest::Ping => Self::respond(&responder, IpcResponse::Pong).await,
             IpcRequest::Freeze => self.handle_freeze(responder).await,
-            IpcRequest::Query(text, limit) => {
-                self.handle_query(text.to_string(), *limit, responder).await
-            }
-            IpcRequest::Rehydrate(payload) => {
-                self.handle_rehydrate(payload.clone(), responder).await;
-            }
+            IpcRequest::Query { text, limit } => self.handle_query(text, limit, responder).await,
+            IpcRequest::Rehydrate { payload } => self.handle_rehydrate(payload, responder).await,
         }
     }
 }

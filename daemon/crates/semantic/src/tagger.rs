@@ -12,7 +12,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use serde::Deserialize;
 use tracing::info;
@@ -104,19 +104,23 @@ impl Tagger {
         }
 
         let mut sampler = LlamaSampler::greedy();
-        let mut out = String::new();
+        // Accumulate raw piece bytes: a multi-byte UTF-8 character can be
+        // split across tokens, so decoding per token would mangle it.
+        let mut out_bytes: Vec<u8> = Vec::new();
         for _ in 0..MAX_GENERATED_TOKENS {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             if self.model.is_eog_token(token) {
                 break;
             }
-            out.push_str(&self.model.token_to_str(token, Special::Tokenize).unwrap_or_default());
+            out_bytes.extend(
+                self.model.token_to_piece_bytes(token, 8, true, None).unwrap_or_default(),
+            );
             batch.clear();
             batch.add(token, pos, &[0], true).map_err(|e| llm(&e))?;
             ctx.decode(&mut batch).map_err(|e| llm(&e))?;
             pos += 1;
         }
-        Ok(out)
+        Ok(String::from_utf8_lossy(&out_bytes).into_owned())
     }
 }
 

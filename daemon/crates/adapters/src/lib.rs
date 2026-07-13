@@ -1,4 +1,4 @@
-//! State-extraction adapters: turn the live desktop into `ExtractedNode`s.
+//! State-extraction adapters: turn the live desktop into domain `WindowNode`s.
 //!
 //! Specialized adapters (Chrome, Terminal.app, VS Code/Cursor) capture deep
 //! state; every other visible app degrades to a Generic node (bundle id +
@@ -6,67 +6,20 @@
 //! it inside `spawn_blocking`.
 
 mod chrome;
-pub mod rehydrate;
 mod editor;
 mod generic;
 mod osascript;
+pub mod rehydrate;
 mod terminal;
 
+use temporal_domain::WindowNode;
 use tracing::warn;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdapterKind {
-    Chrome,
-    TerminalApp,
-    VSCode,
-    Cursor,
-    Generic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Geometry {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrowserTab {
-    pub url: String,
-    pub title: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TerminalTab {
-    pub tty: String,
-    pub working_directory: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Payload {
-    Browser { tabs: Vec<BrowserTab>, active_tab_index: i32 },
-    Terminal { tabs: Vec<TerminalTab> },
-    Editor { folder_path: String, open_files: Vec<String> },
-    Generic,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExtractedNode {
-    pub node_id: String,
-    pub bundle_id: String,
-    pub app_name: String,
-    pub window_title: String,
-    pub geometry: Geometry,
-    pub kind: AdapterKind,
-    pub payload: Payload,
-}
 
 /// Extraction always succeeds overall; per-adapter failures become warnings
 /// and the affected app simply contributes no (or only generic) nodes.
 #[derive(Debug, Default)]
 pub struct ExtractionReport {
-    pub nodes: Vec<ExtractedNode>,
+    pub nodes: Vec<WindowNode>,
     pub warnings: Vec<String>,
 }
 
@@ -87,7 +40,7 @@ pub fn extract_workspace() -> ExtractionReport {
         }
     };
 
-    // Resolve each pid once; identity drives adapter dispatch.
+    // Resolve each pid once; identity drives the generic adapter.
     let mut identities: std::collections::HashMap<i32, temporal_macos_ffi::AppIdentity> =
         std::collections::HashMap::new();
     for w in &windows {
@@ -95,6 +48,7 @@ pub fn extract_workspace() -> ExtractionReport {
             .entry(w.owner_pid)
             .or_insert_with(|| temporal_macos_ffi::bundle::identify_pid(w.owner_pid));
     }
+
     // Dispatch on running processes, not visible windows: apps whose windows
     // are fullscreen or on another Space never appear in CGWindowList.
     let running_ids = temporal_macos_ffi::bundle::running_bundle_ids();
@@ -113,7 +67,7 @@ pub fn extract_workspace() -> ExtractionReport {
     }
     if running(VSCODE_BUNDLE_ID) {
         consumed.push(VSCODE_BUNDLE_ID);
-        editor::extract(editor::Variant::VSCode, &mut report);
+        editor::extract(editor::Variant::VsCode, &mut report);
     }
     if running(CURSOR_BUNDLE_ID) {
         consumed.push(CURSOR_BUNDLE_ID);
