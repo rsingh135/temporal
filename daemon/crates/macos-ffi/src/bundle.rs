@@ -41,10 +41,10 @@ pub fn running_bundle_ids() -> std::collections::HashSet<String> {
 }
 
 fn identify_executable(exe: &Path, pid: i32) -> AppIdentity {
-    if let Some(bundle_root) = enclosing_app_bundle(exe) {
-        if let Some(identity) = read_bundle_identity(&bundle_root) {
-            return identity;
-        }
+    if let Some(bundle_root) = enclosing_app_bundle(exe)
+        && let Some(identity) = read_bundle_identity(&bundle_root)
+    {
+        return identity;
     }
     let fallback_name = exe
         .file_name()

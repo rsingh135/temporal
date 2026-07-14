@@ -24,6 +24,17 @@ pub enum ProbeCommand {
     },
     /// Rehydrate a stored workspace by id (no exclusions).
     Rehydrate { workspace_id: String },
+    /// Screen Recording / Accessibility permission diagnostics.
+    Status,
+    /// Delete old workspace records.
+    Prune {
+        /// Delete workspaces captured more than this many days ago.
+        #[arg(long, conflicts_with = "keep_latest")]
+        older_than_days: Option<f64>,
+        /// Keep only the N most recently captured workspaces.
+        #[arg(long, conflicts_with = "older_than_days")]
+        keep_latest: Option<i32>,
+    },
 }
 
 /// Asks the daemon for its recent workspaces and returns the one with the
@@ -64,6 +75,20 @@ pub async fn run_probe(socket_path: &Path, command: ProbeCommand) -> Result<()> 
                 payload: RehydrationPayload { workspace, excluded_node_ids: Vec::new() },
             }
         }
+        ProbeCommand::Status => IpcRequest::PermissionStatus,
+        ProbeCommand::Prune { older_than_days, keep_latest } => {
+            if older_than_days.is_none() && keep_latest.is_none() {
+                bail!("prune requires --older-than-days or --keep-latest");
+            }
+            let older_than_unix_ms = older_than_days.map(|days| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before 1970")
+                    .as_millis() as i64;
+                now_ms - (days * 86_400_000.0) as i64
+            });
+            IpcRequest::Prune { older_than_unix_ms, keep_latest: *keep_latest }
+        }
     };
     write_frame(&mut stream, request_to_wire(&request).as_bytes()).await?;
 
@@ -81,9 +106,14 @@ pub async fn run_probe(socket_path: &Path, command: ProbeCommand) -> Result<()> 
                 eprintln!("({} candidates)", candidates.len());
                 break;
             }
+            IpcResponse::PermissionStatus { screen_recording, accessibility } => {
+                eprintln!("screen recording: {screen_recording}, accessibility: {accessibility}");
+                break;
+            }
             IpcResponse::FreezeStarted { .. }
             | IpcResponse::RehydrateStarted
-            | IpcResponse::Progress { .. } => continue,
+            | IpcResponse::Progress { .. }
+            | IpcResponse::NodeResult { .. } => continue,
         }
     }
     Ok(())

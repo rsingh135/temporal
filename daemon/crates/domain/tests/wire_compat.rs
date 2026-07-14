@@ -92,3 +92,75 @@ fn wire_tags_match_the_old_codec_exactly() {
         r#"{"type":"query","text":"t","limit":5}"#
     );
 }
+
+#[test]
+fn old_workspaces_decode_with_empty_groups() {
+    // Pre-grouping records have no "groups" key; serde default fills [].
+    for line in &lines()[2..4] {
+        let decoded = workspace_from_wire(line).expect("old workspace decodes");
+        assert!(decoded.groups.is_empty());
+    }
+}
+
+#[test]
+fn group_bearing_workspace_round_trips() {
+    use temporal_domain::{ItemRef, WorkspaceGroup};
+    let mut ws = workspace_from_wire(lines()[2]).expect("rich workspace");
+    ws.groups = vec![WorkspaceGroup {
+        group_id: "g0".into(),
+        label: "coding".into(),
+        items: vec![
+            ItemRef { node_id: "n0".into(), tab_index: Some(1) },
+            ItemRef { node_id: "n1".into(), tab_index: None },
+        ],
+    }];
+    let again = workspace_from_wire(&workspace_to_wire(&ws)).expect("re-decode");
+    assert_eq!(ws, again);
+}
+
+#[test]
+fn query_candidate_without_kind_defaults_to_workspace() {
+    use temporal_domain::{CandidateKind, QueryCandidate};
+    // A frame from an older peer: no "kind", no "sourceWorkspaceId".
+    let json = format!(r#"{{"workspace":{},"score":0.5}}"#, lines()[2]);
+    let candidate: QueryCandidate = serde_json::from_str(&json).expect("decodes");
+    assert_eq!(candidate.kind, CandidateKind::Workspace);
+    assert_eq!(candidate.source_workspace_id, None);
+
+    let reencoded = serde_json::to_string(&candidate).expect("encodes");
+    let again: QueryCandidate = serde_json::from_str(&reencoded).expect("re-decode");
+    assert_eq!(candidate, again);
+}
+
+#[test]
+fn new_variants_round_trip() {
+    let requests = [
+        IpcRequest::PermissionStatus,
+        IpcRequest::Prune { older_than_unix_ms: Some(123), keep_latest: None },
+        IpcRequest::Prune { older_than_unix_ms: None, keep_latest: Some(5) },
+    ];
+    for request in requests {
+        let again = request_from_wire(&request_to_wire(&request)).expect("re-decode");
+        assert_eq!(request, again);
+    }
+
+    let responses = [
+        IpcResponse::NodeResult {
+            node_id: "n0".into(),
+            app_name: "Chrome".into(),
+            ok: false,
+            message: Some("not installed".into()),
+        },
+        IpcResponse::NodeResult {
+            node_id: "n1".into(),
+            app_name: "Terminal".into(),
+            ok: true,
+            message: None,
+        },
+        IpcResponse::PermissionStatus { screen_recording: true, accessibility: false },
+    ];
+    for response in responses {
+        let again = response_from_wire(&response_to_wire(&response)).expect("re-decode");
+        assert_eq!(response, again);
+    }
+}

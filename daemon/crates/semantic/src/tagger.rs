@@ -23,6 +23,9 @@ const N_CTX: u32 = 4096;
 const MAX_GENERATED_TOKENS: usize = 320;
 /// Keep prompts comfortably inside N_CTX (~4 chars/token heuristic).
 const MAX_CONTEXT_CHARS: usize = 9000;
+/// Per-group slice of the labeling prompt; a handful of member titles is
+/// plenty of signal for a 2-4 word label.
+const MAX_GROUP_CONTEXT_CHARS: usize = 800;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TagResult {
@@ -75,6 +78,44 @@ impl Tagger {
         let raw = self.complete(&prompt)?;
         parse_tag_result(&raw)
             .ok_or_else(|| SemanticError::Llm(format!("model returned unparseable output: {raw}")))
+    }
+
+    /// Names each semantic group of one workspace. `group_contexts[i]` is the
+    /// newline-joined member titles of group i; the reply has exactly one
+    /// label per group, in order. One generation covers all groups so the
+    /// model sees them side by side and picks contrastive labels.
+    pub fn label_groups(&self, group_contexts: &[String]) -> Result<Vec<String>, SemanticError> {
+        if group_contexts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let per_group_budget =
+            (MAX_CONTEXT_CHARS / group_contexts.len()).min(MAX_GROUP_CONTEXT_CHARS);
+        let numbered: String = group_contexts
+            .iter()
+            .enumerate()
+            .map(|(i, ctx)| {
+                let ctx: String = ctx.chars().take(per_group_budget).collect();
+                format!("Group {}:\n{}\n", i + 1, ctx)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let n = group_contexts.len();
+        // Keyed object, not a positional array: small models reorder array
+        // elements, and a swapped label is worse than a heuristic one. The
+        // number sitting next to each label keeps the association explicit.
+        let prompt = format!(
+            "<|im_start|>system\n\
+             You label groups of related windows and browser tabs from one desktop. Reply with \
+             ONLY a JSON object mapping each group number to a short label (2-4 words, no \
+             punctuation) naming that group's activity or project. Label all {n} groups.\n\
+             Example reply: {{\"1\": \"temporal rust daemon\", \"2\": \"apartment hunting\"}} \
+             /no_think<|im_end|>\n\
+             <|im_start|>user\n{numbered}<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        let raw = self.complete(&prompt)?;
+        parse_labels(&raw, n)
+            .ok_or_else(|| SemanticError::Llm(format!("model returned unparseable labels: {raw}")))
     }
 
     fn complete(&self, prompt: &str) -> Result<String, SemanticError> {
@@ -151,9 +192,47 @@ fn parse_tag_result(raw: &str) -> Option<TagResult> {
     Some(TagResult { summary, tags })
 }
 
+/// Pulls a JSON object of group-number → label out of the model output and
+/// returns the labels ordered 1..=n; None (missing/empty keys, junk) sends
+/// the caller back to heuristic labels.
+fn parse_labels(raw: &str, n: usize) -> Option<Vec<String>> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let parsed: std::collections::HashMap<String, String> =
+        serde_json::from_str(&raw[start..=end]).ok()?;
+    (1..=n)
+        .map(|index| {
+            let label = parsed.get(&index.to_string())?.trim().to_string();
+            if label.is_empty() {
+                None
+            } else {
+                Some(label)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_labels_wrapped_in_think_block_and_prose() {
+        let raw = "<think>\n</think>\nHere: {\"2\": \"apartment hunting\", \"1\": \" temporal rust daemon \"} ok";
+        let labels = parse_labels(raw, 2).unwrap();
+        assert_eq!(labels, vec!["temporal rust daemon", "apartment hunting"]);
+    }
+
+    #[test]
+    fn rejects_missing_keys_and_empties() {
+        assert!(parse_labels("{\"1\": \"one\", \"2\": \"two\"}", 3).is_none());
+        assert!(parse_labels("{\"1\": \"one\", \"3\": \"three\"}", 2).is_none());
+        assert!(parse_labels("{\"1\": \"one\", \"2\": \"  \"}", 2).is_none());
+        assert!(parse_labels("no json", 1).is_none());
+    }
 
     #[test]
     fn parses_json_wrapped_in_think_block_and_prose() {

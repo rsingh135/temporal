@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use temporal_domain::{AdapterKind, BrowserTab, NodePayload, WindowGeometry, WindowNode};
 
-use crate::osascript::run_jxa_json;
+use crate::osascript::run_jxa_json_retrying;
 use crate::ExtractionReport;
 
 const SCRIPT: &str = r#"
@@ -38,7 +38,7 @@ struct JxaTab {
 }
 
 pub fn extract(report: &mut ExtractionReport) {
-    let windows: Vec<JxaWindow> = match run_jxa_json(SCRIPT) {
+    let windows: Vec<JxaWindow> = match run_jxa_json_retrying(SCRIPT) {
         Ok(windows) => windows,
         Err(e) => {
             report.warnings.push(format!("chrome: {e}"));

@@ -9,6 +9,7 @@ mod chrome;
 mod editor;
 mod generic;
 mod osascript;
+mod proc_timeout;
 pub mod rehydrate;
 mod terminal;
 

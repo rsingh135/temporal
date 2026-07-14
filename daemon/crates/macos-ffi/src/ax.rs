@@ -58,11 +58,37 @@ pub fn place_windows(pid: i32, frames: &[(f64, f64, f64, f64)]) -> Result<usize,
             let Some(item) = windows.get(i as isize) else { break };
             let window = item.as_CFTypeRef() as AXUIElementRef;
             let (x, y, w, h) = *frame;
-            set_frame(window, x, y, w, h)?;
+            set_frame_retrying(window, x, y, w, h)?;
             placed += 1;
         }
         Ok(placed)
     }
+}
+
+/// `set_frame` with bounded retries: a just-launched app's window can
+/// transiently reject AX writes before it's fully interactive.
+unsafe fn set_frame_retrying(
+    window: AXUIElementRef,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut last_err = String::new();
+    for attempt in 0..ATTEMPTS {
+        match unsafe { set_frame(window, x, y, w, h) } {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(BACKOFF);
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 unsafe fn set_frame(window: AXUIElementRef, x: f64, y: f64, w: f64, h: f64) -> Result<(), String> {

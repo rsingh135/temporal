@@ -98,6 +98,31 @@ body,
     text-overflow: ellipsis;
 }
 
+/* Sub-group rows sit indented directly under their parent snapshot. */
+.candidate.group {
+    padding-left: 30px;
+}
+
+.candidate.group .candidate-summary {
+    font-weight: 400;
+}
+
+/* Prompt-assembled virtual workspace: the accented first row. */
+.candidate.assembled {
+    border-left: 2px solid rgba(140, 170, 255, 0.9);
+    border-radius: 3px 9px 9px 3px;
+    background: rgba(96, 130, 255, 0.1);
+}
+
+.candidate.assembled.selected {
+    background: rgba(96, 130, 255, 0.26);
+}
+
+.candidate-glyph {
+    color: rgba(140, 170, 255, 0.9);
+    margin-right: 6px;
+}
+
 .staging-header {
     display: flex;
     justify-content: space-between;
@@ -132,6 +157,15 @@ body,
 .node.excluded .node-text {
     opacity: 0.35;
     text-decoration: line-through;
+}
+
+.node.focused {
+    background: rgba(96, 130, 255, 0.18);
+    outline: 1px solid rgba(96, 130, 255, 0.4);
+}
+
+.nodes:focus {
+    outline: none;
 }
 
 .node input {
@@ -199,7 +233,6 @@ button.approve:hover {
     background: #5d7bff;
 }
 
-.busy,
 .feedback {
     flex: 1;
     display: flex;
@@ -216,4 +249,96 @@ button.approve:hover {
 
 .feedback.ok {
     color: #7dffb2;
+}
+
+.busy {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 12px;
+    padding: 0 24px;
+}
+
+.busy-label {
+    font-size: 14px;
+    text-align: center;
+}
+
+.busy-bar {
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.1);
+    overflow: hidden;
+}
+
+.busy-bar-fill {
+    height: 100%;
+    background: #4a6cf7;
+    transition: width 0.2s ease;
+}
+
+.busy-nodes {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.busy-node {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+    padding: 4px 2px;
+}
+
+.busy-node-icon {
+    flex-shrink: 0;
+    width: 14px;
+    text-align: center;
+}
+
+.busy-node.pending .busy-node-icon {
+    opacity: 0.4;
+}
+
+.busy-node.ok .busy-node-icon {
+    color: #7dffb2;
+}
+
+.busy-node.err .busy-node-icon {
+    color: #ff7d7d;
+}
+
+.busy-node-name {
+    flex-shrink: 0;
+}
+
+.busy-node-message {
+    color: rgba(236, 236, 241, 0.45);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.empty-state {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    color: rgba(236, 236, 241, 0.45);
+    text-align: center;
+    padding: 0 12px;
+}
+
+.permission-banner {
+    font-size: 11px;
+    color: #ffcf7d;
+    background: rgba(255, 207, 125, 0.12);
+    border: 1px solid rgba(255, 207, 125, 0.25);
+    border-radius: 8px;
+    padding: 8px 10px;
 }

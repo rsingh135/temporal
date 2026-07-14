@@ -4,4 +4,4 @@ import type { RehydrationPayload } from "./RehydrationPayload";
 /**
  * UI -> daemon requests over the Unix domain socket.
  */
-export type IpcRequest = { "type": "ping" } | { "type": "freeze" } | { "type": "query", text: string, limit: number, } | { "type": "rehydrate", payload: RehydrationPayload, };
+export type IpcRequest = { "type": "ping" } | { "type": "freeze" } | { "type": "query", text: string, limit: number, } | { "type": "rehydrate", payload: RehydrationPayload, } | { "type": "permission-status" } | { "type": "prune", olderThanUnixMs: number | null, keepLatest: number | null, };

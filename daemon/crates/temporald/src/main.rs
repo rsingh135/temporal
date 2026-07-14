@@ -74,6 +74,9 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            if let Some(embedder) = &embedder {
+                handler::spawn_item_backfill(Arc::clone(&storage), Arc::clone(embedder));
+            }
             let handler = Arc::new(handler::DaemonHandler::new(storage, embedder, tagger));
             info!(socket = %socket_path.display(), db = %db_path.display(), "temporald starting");
 

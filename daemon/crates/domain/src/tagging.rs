@@ -7,7 +7,7 @@
 
 use crate::types::{NodePayload, WorkspaceState};
 
-fn url_host(url: &str) -> String {
+pub(crate) fn url_host(url: &str) -> String {
     let Some(idx) = url.find("://") else { return String::new() };
     let rest = &url[idx + 3..];
     let host = rest.split('/').next().unwrap_or("");
@@ -15,7 +15,7 @@ fn url_host(url: &str) -> String {
     host.strip_prefix("www.").unwrap_or(host).to_string()
 }
 
-fn base_name(path: &str) -> String {
+pub(crate) fn base_name(path: &str) -> String {
     let trimmed = if path.len() > 1 { path.trim_end_matches('/') } else { path };
     trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
 }
@@ -119,6 +119,9 @@ pub fn apply_llm_tags(summary: &str, llm_tags: &[String], mut w: WorkspaceState)
 pub fn embedding_text(w: &WorkspaceState) -> String {
     let mut parts: Vec<String> = vec![w.summary.clone()];
     parts.extend(w.tags.iter().cloned());
+    // Group labels are condensed activity names — high-signal, and absent on
+    // pre-grouping records (whose text therefore stays unchanged).
+    parts.extend(w.groups.iter().map(|g| g.label.clone()));
     for node in &w.nodes {
         parts.push(node.app_name.clone());
         parts.push(node.window_title.clone());
@@ -172,6 +175,7 @@ mod tests {
             summary: String::new(),
             tags: vec![],
             nodes,
+            groups: vec![],
         }
     }
 

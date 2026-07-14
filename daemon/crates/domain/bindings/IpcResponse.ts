@@ -2,6 +2,7 @@
 import type { QueryCandidate } from "./QueryCandidate";
 
 /**
- * Daemon -> UI responses. Progress may stream multiple times before Done.
+ * Daemon -> UI responses. Progress and NodeResult may stream multiple times
+ * before Done.
  */
-export type IpcResponse = { "type": "pong" } | { "type": "freeze-started", workspaceId: string, } | { "type": "query-results", candidates: Array<QueryCandidate>, } | { "type": "rehydrate-started" } | { "type": "progress", stage: string, detail: string, percent: number, } | { "type": "done", message: string, } | { "type": "error", code: string, message: string, };
+export type IpcResponse = { "type": "pong" } | { "type": "freeze-started", workspaceId: string, } | { "type": "query-results", candidates: Array<QueryCandidate>, } | { "type": "rehydrate-started" } | { "type": "progress", stage: string, detail: string, percent: number, } | { "type": "node-result", nodeId: string, appName: string, ok: boolean, message: string | null, } | { "type": "permission-status", screenRecording: boolean, accessibility: boolean, } | { "type": "done", message: string, } | { "type": "error", code: string, message: string, };

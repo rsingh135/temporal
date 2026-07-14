@@ -3,13 +3,17 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
 use temporal_domain::{AdapterKind, NodePayload, TerminalTab, WindowGeometry, WindowNode};
 use tracing::debug;
 
-use crate::osascript::run_jxa_json;
+use crate::osascript::run_jxa_json_retrying;
+use crate::proc_timeout;
 use crate::ExtractionReport;
+
+const LSOF_TIMEOUT: Duration = Duration::from_secs(2);
 
 const SCRIPT: &str = r#"
 const app = Application("Terminal");
@@ -40,7 +44,7 @@ struct JxaTab {
 }
 
 pub fn extract(report: &mut ExtractionReport) {
-    let windows: Vec<JxaWindow> = match run_jxa_json(SCRIPT) {
+    let windows: Vec<JxaWindow> = match run_jxa_json_retrying(SCRIPT) {
         Ok(windows) => windows,
         Err(e) => {
             report.warnings.push(format!("terminal: {e}"));
@@ -85,17 +89,19 @@ pub fn extract(report: &mut ExtractionReport) {
 }
 
 /// cwd of the shell attached to `tty`: the process with the lowest pid that
-/// has the tty open is the login shell.
+/// has the tty open is the login shell. A hung `lsof` degrades to `None`
+/// instead of blocking the whole freeze.
 fn tty_working_directory(tty: &str) -> Option<String> {
-    let pids = Command::new("/usr/sbin/lsof").arg("-t").arg(tty).output().ok()?;
+    let mut list_cmd = Command::new("/usr/sbin/lsof");
+    list_cmd.arg("-t").arg(tty);
+    let pids = proc_timeout::run_with_timeout(list_cmd, LSOF_TIMEOUT).ok()?;
     let shell_pid = String::from_utf8_lossy(&pids.stdout)
         .lines()
         .filter_map(|l| l.trim().parse::<u32>().ok())
         .min()?;
-    let cwd = Command::new("/usr/sbin/lsof")
-        .args(["-a", "-p", &shell_pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
+    let mut cwd_cmd = Command::new("/usr/sbin/lsof");
+    cwd_cmd.args(["-a", "-p", &shell_pid.to_string(), "-d", "cwd", "-Fn"]);
+    let cwd = proc_timeout::run_with_timeout(cwd_cmd, LSOF_TIMEOUT).ok()?;
     let dir = String::from_utf8_lossy(&cwd.stdout)
         .lines()
         .find(|l| l.starts_with('n'))

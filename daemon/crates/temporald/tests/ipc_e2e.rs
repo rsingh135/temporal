@@ -58,6 +58,7 @@ async fn roundtrip(stream: &mut UnixStream, request: IpcRequest) -> Vec<IpcRespo
                 | IpcResponse::Done { .. }
                 | IpcResponse::Error { .. }
                 | IpcResponse::QueryResults { .. }
+                | IpcResponse::PermissionStatus { .. }
         );
         responses.push(response);
         if terminal {
@@ -81,10 +82,18 @@ async fn ping_freeze_query_flow() {
     assert!(matches!(responses.last().unwrap(), IpcResponse::Done { .. }));
 
     // Query: returns the single stored workspace decoded through the codec.
+    // Without models the daemon degrades to plain recency: no groups are
+    // computed and no assembled candidate appears.
     let responses =
         roundtrip(&mut stream, IpcRequest::Query { text: "anything".into(), limit: 5 }).await;
     match responses.last().unwrap() {
-        IpcResponse::QueryResults { candidates } => assert_eq!(candidates.len(), 1),
+        IpcResponse::QueryResults { candidates } => {
+            assert_eq!(candidates.len(), 1);
+            assert!(candidates
+                .iter()
+                .all(|c| c.kind == temporal_domain::CandidateKind::Workspace));
+            assert!(candidates.iter().all(|c| c.workspace.groups.is_empty()));
+        }
         other => panic!("expected QueryResults, got {other:?}"),
     }
 
@@ -97,6 +106,49 @@ async fn ping_freeze_query_flow() {
     // Connection still usable afterwards.
     let responses = roundtrip(&mut stream, IpcRequest::Ping).await;
     assert!(matches!(responses.last().unwrap(), IpcResponse::Pong));
+}
+
+#[tokio::test]
+async fn permission_status_roundtrip() {
+    let daemon = start_daemon().await;
+    let mut stream = UnixStream::connect(&daemon.socket_path).await.expect("connect");
+    let responses = roundtrip(&mut stream, IpcRequest::PermissionStatus).await;
+    // Booleans are environment-dependent (CI has neither grant); only the
+    // shape is asserted here.
+    assert!(matches!(responses.last().unwrap(), IpcResponse::PermissionStatus { .. }));
+}
+
+#[tokio::test]
+async fn prune_keep_latest_roundtrip() {
+    let daemon = start_daemon().await;
+    let mut stream = UnixStream::connect(&daemon.socket_path).await.expect("connect");
+
+    roundtrip(&mut stream, IpcRequest::Freeze).await;
+    roundtrip(&mut stream, IpcRequest::Freeze).await;
+
+    let responses = roundtrip(
+        &mut stream,
+        IpcRequest::Prune { older_than_unix_ms: None, keep_latest: Some(1) },
+    )
+    .await;
+    assert!(matches!(responses.last().unwrap(), IpcResponse::Done { .. }));
+
+    let responses =
+        roundtrip(&mut stream, IpcRequest::Query { text: String::new(), limit: 100 }).await;
+    match responses.last().unwrap() {
+        IpcResponse::QueryResults { candidates } => assert_eq!(candidates.len(), 1),
+        other => panic!("expected QueryResults, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn prune_rejects_ambiguous_request() {
+    let daemon = start_daemon().await;
+    let mut stream = UnixStream::connect(&daemon.socket_path).await.expect("connect");
+    let responses =
+        roundtrip(&mut stream, IpcRequest::Prune { older_than_unix_ms: None, keep_latest: None })
+            .await;
+    assert!(matches!(responses.last().unwrap(), IpcResponse::Error { .. }));
 }
 
 #[tokio::test]

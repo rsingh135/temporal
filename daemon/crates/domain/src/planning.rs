@@ -39,6 +39,7 @@ mod tests {
             summary: String::new(),
             tags: vec![],
             nodes: vec![node("n0"), node("n1"), node("n2")],
+            groups: vec![],
         };
         let included = included_nodes(&ws, &["n1".into(), "ghost".into()]);
         let ids: Vec<&str> = included.iter().map(|n| n.node_id.as_str()).collect();

@@ -1929,6 +1929,7 @@ dependencies = [
  "temporal-adapters",
  "temporal-domain",
  "temporal-ipc",
+ "temporal-macos-ffi",
  "temporal-semantic",
  "temporal-storage",
  "tokio",

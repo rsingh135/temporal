@@ -10,10 +10,11 @@ use temporal_domain::wire::{
     request_from_wire, response_to_wire, tags_to_wire, workspace_from_wire, workspace_to_wire,
 };
 use temporal_domain::{
-    planning, tagging, IpcRequest, IpcResponse, QueryCandidate, RehydrationPayload, WorkspaceState,
+    grouping, planning, tagging, CandidateKind, IpcRequest, IpcResponse, QueryCandidate,
+    RehydrationPayload, WorkspaceState,
 };
 use temporal_ipc::{Handler, Responder};
-use temporal_storage::{Storage, WorkspaceRecord};
+use temporal_storage::{ItemRecord, Storage, WorkspaceRecord};
 use tracing::{info, warn};
 
 /// The ort session is not Sync; a std Mutex serializes embeddings (they take
@@ -90,6 +91,7 @@ impl DaemonHandler {
             summary: String::new(),
             tags: Vec::new(),
             nodes: report.nodes,
+            groups: Vec::new(),
         });
 
         Self::respond(
@@ -97,25 +99,48 @@ impl DaemonHandler {
             IpcResponse::Progress { stage: "persist".into(), detail: String::new(), percent: 90 },
         )
         .await;
-        let record = WorkspaceRecord {
-            workspace_id: workspace_id.clone(),
-            captured_at_unix_ms: now_ms,
-            summary: workspace.summary.clone(),
-            tags_json: tags_to_wire(&workspace),
-            payload_json: workspace_to_wire(&workspace),
-        };
-        let embedding_text = tagging::embedding_text(&workspace);
         let storage = Arc::clone(&self.storage);
         let embedder = self.embedder.clone();
-        let id_for_store = workspace_id.clone();
         let stored = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            // Groups must exist before the record is built: they live inside
+            // payload_json. Item vectors land alongside for prompt assembly.
+            let mut workspace = workspace;
+            let mut item_rows: Vec<(ItemRecord, Vec<f32>)> = Vec::new();
+            if let Some(embedder) = &embedder {
+                let items = grouping::items_for(&workspace);
+                let mut guard = embedder.lock().expect("embedder mutex poisoned");
+                let mut vectors = Vec::with_capacity(items.len());
+                for item in &items {
+                    vectors.push(guard.embed_document(&item.embed_text)?);
+                }
+                drop(guard);
+                workspace.groups = grouping::build_groups(&items, &vectors);
+                item_rows = items
+                    .iter()
+                    .zip(vectors)
+                    .map(|(item, vector)| {
+                        (
+                            item_record(&workspace.workspace_id, workspace.captured_at_unix_ms, item),
+                            vector,
+                        )
+                    })
+                    .collect();
+            }
+            let record = WorkspaceRecord {
+                workspace_id: workspace.workspace_id.clone(),
+                captured_at_unix_ms: workspace.captured_at_unix_ms,
+                summary: workspace.summary.clone(),
+                tags_json: tags_to_wire(&workspace),
+                payload_json: workspace_to_wire(&workspace),
+            };
             storage.upsert_workspace(&record)?;
-            if let Some(embedder) = embedder {
+            if let Some(embedder) = &embedder {
                 let vector = embedder
                     .lock()
                     .expect("embedder mutex poisoned")
-                    .embed_document(&embedding_text)?;
-                storage.upsert_embedding(&id_for_store, &vector)?;
+                    .embed_document(&tagging::embedding_text(&workspace))?;
+                storage.upsert_embedding(&workspace.workspace_id, &vector)?;
+                storage.replace_items(&workspace.workspace_id, &item_rows)?;
             }
             Ok(())
         })
@@ -156,7 +181,38 @@ impl DaemonHandler {
                 let result = tagger.lock().expect("tagger mutex poisoned").generate(&context)?;
                 info!(workspace_id, summary = %result.summary, tags = ?result.tags, "llm tags generated");
 
-                let enriched = tagging::apply_llm_tags(&result.summary, &result.tags, workspace);
+                let mut enriched = tagging::apply_llm_tags(&result.summary, &result.tags, workspace);
+                // Upgrade heuristic group labels; membership is fixed at
+                // freeze so ids stay stable and the UI never reshuffles.
+                if enriched.groups.len() >= 2 {
+                    let items = grouping::items_for(&enriched);
+                    let contexts: Vec<String> = enriched
+                        .groups
+                        .iter()
+                        .map(|group| {
+                            group
+                                .items
+                                .iter()
+                                .filter_map(|r| {
+                                    items.iter().find(|item| item.item_ref == *r)
+                                })
+                                .map(|item| item.title.clone())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .collect();
+                    match tagger.lock().expect("tagger mutex poisoned").label_groups(&contexts) {
+                        Ok(labels) => {
+                            for (group, label) in enriched.groups.iter_mut().zip(labels) {
+                                group.label = label;
+                            }
+                            info!(workspace_id, groups = enriched.groups.len(), "llm group labels applied");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "group labeling failed; heuristic labels kept");
+                        }
+                    }
+                }
                 let updated = WorkspaceRecord {
                     workspace_id: workspace_id.clone(),
                     captured_at_unix_ms: record.captured_at_unix_ms,
@@ -184,49 +240,17 @@ impl DaemonHandler {
         let storage = Arc::clone(&self.storage);
         let embedder = self.embedder.clone();
         let limit_n = limit.max(0) as usize;
-        // Semantic KNN when the model is available; recency order (score 0)
-        // otherwise, and for empty queries ("show me recent workspaces").
-        let listed =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(WorkspaceRecord, f64)>> {
-                match embedder {
-                    Some(_) | None if text.trim().is_empty() => Ok(storage
-                        .list_workspaces()?
-                        .into_iter()
-                        .take(limit_n)
-                        .map(|r| (r, 0.0))
-                        .collect()),
-                    Some(embedder) => {
-                        let vector =
-                            embedder.lock().expect("embedder mutex poisoned").embed_query(&text)?;
-                        Ok(storage.search_embeddings(&vector, limit_n)?)
-                    }
-                    None => Ok(storage
-                        .list_workspaces()?
-                        .into_iter()
-                        .take(limit_n)
-                        .map(|r| (r, 0.0))
-                        .collect()),
-                }
-            })
-            .await;
-        let records = match listed {
-            Ok(Ok(records)) => records,
-            Ok(Err(e)) => return Self::error(&responder, "E_STORAGE", e).await,
-            Err(join_err) => return Self::error(&responder, "E_INTERNAL", join_err).await,
-        };
-
-        let mut candidates = Vec::new();
-        for (record, score) in records {
-            match workspace_from_wire(&record.payload_json) {
-                Ok(workspace) => candidates.push(QueryCandidate { workspace, score }),
-                Err(e) => {
-                    // A payload we wrote that no longer decodes is a bug, not
-                    // a user error; surface loudly but keep serving the rest.
-                    warn!(workspace_id = %record.workspace_id, error = %e, "stored payload failed to decode");
-                }
+        let built = tokio::task::spawn_blocking(move || {
+            build_candidates(&storage, embedder.as_ref(), &text, limit_n)
+        })
+        .await;
+        match built {
+            Ok(Ok(candidates)) => {
+                Self::respond(&responder, IpcResponse::QueryResults { candidates }).await
             }
+            Ok(Err(e)) => Self::error(&responder, "E_STORAGE", e).await,
+            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
         }
-        Self::respond(&responder, IpcResponse::QueryResults { candidates }).await;
     }
 
     async fn handle_rehydrate(&self, payload: RehydrationPayload, responder: Responder) {
@@ -234,19 +258,24 @@ impl DaemonHandler {
         let nodes = planning::included_nodes(&payload.workspace, &payload.excluded_node_ids);
         let total = nodes.len();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, String)>(32);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<temporal_adapters::rehydrate::NodeEvent>(32);
         let work = tokio::task::spawn_blocking(move || {
-            temporal_adapters::rehydrate::rehydrate_nodes(&nodes, |i, label| {
-                let _ = tx.blocking_send((i, label.to_string()));
+            temporal_adapters::rehydrate::rehydrate_nodes(&nodes, |event| {
+                let _ = tx.blocking_send(event);
             })
         });
-        while let Some((i, label)) = rx.recv().await {
-            let percent = (i * 100).checked_div(total).unwrap_or(100) as i32;
-            Self::respond(
-                &responder,
-                IpcResponse::Progress { stage: "launch".into(), detail: label, percent },
-            )
-            .await;
+        use temporal_adapters::rehydrate::NodeEvent;
+        while let Some(event) = rx.recv().await {
+            let response = match event {
+                NodeEvent::Started { index, app_name } => {
+                    let percent = (index * 100).checked_div(total).unwrap_or(100) as i32;
+                    IpcResponse::Progress { stage: "launch".into(), detail: app_name, percent }
+                }
+                NodeEvent::Finished { node_id, app_name, ok, message, .. } => {
+                    IpcResponse::NodeResult { node_id, app_name, ok, message }
+                }
+            };
+            Self::respond(&responder, response).await;
         }
         match work.await {
             Ok(outcome) => {
@@ -267,6 +296,47 @@ impl DaemonHandler {
         }
     }
 
+    async fn handle_permission_status(&self, responder: Responder) {
+        let screen_recording = temporal_macos_ffi::permissions::preflight().screen_recording;
+        let accessibility = temporal_macos_ffi::ax::is_trusted();
+        Self::respond(&responder, IpcResponse::PermissionStatus { screen_recording, accessibility })
+            .await;
+    }
+
+    async fn handle_prune(
+        &self,
+        older_than_unix_ms: Option<i64>,
+        keep_latest: Option<i32>,
+        responder: Responder,
+    ) {
+        let storage = Arc::clone(&self.storage);
+        let removed = match (older_than_unix_ms, keep_latest) {
+            (Some(cutoff), None) => {
+                tokio::task::spawn_blocking(move || storage.prune_older_than(cutoff)).await
+            }
+            (None, Some(keep)) => {
+                let keep = keep.max(0) as usize;
+                tokio::task::spawn_blocking(move || storage.prune_keep_latest(keep)).await
+            }
+            _ => {
+                return Self::error(
+                    &responder,
+                    "E_INVALID",
+                    "prune requires exactly one of olderThanUnixMs or keepLatest",
+                )
+                .await;
+            }
+        };
+        match removed {
+            Ok(Ok(n)) => {
+                Self::respond(&responder, IpcResponse::Done { message: format!("pruned {n} workspace(s)") })
+                    .await
+            }
+            Ok(Err(e)) => Self::error(&responder, "E_STORAGE", e).await,
+            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
+        }
+    }
+
     async fn handle_request(&self, request_json: String, responder: Responder) {
         let request = match request_from_wire(&request_json) {
             Ok(request) => request,
@@ -277,6 +347,10 @@ impl DaemonHandler {
             IpcRequest::Freeze => self.handle_freeze(responder).await,
             IpcRequest::Query { text, limit } => self.handle_query(text, limit, responder).await,
             IpcRequest::Rehydrate { payload } => self.handle_rehydrate(payload, responder).await,
+            IpcRequest::PermissionStatus => self.handle_permission_status(responder).await,
+            IpcRequest::Prune { older_than_unix_ms, keep_latest } => {
+                self.handle_prune(older_than_unix_ms, keep_latest, responder).await
+            }
         }
     }
 }
@@ -296,4 +370,260 @@ pub fn unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before 1970")
         .as_millis() as i64
+}
+
+/// Detached startup backfill: decomposes workspaces stored before item
+/// indexing existed into items + groups, so old snapshots show groups on the
+/// main menu and participate in prompt assembly. Per-workspace failures only
+/// log; freezes maintain items inline from here on.
+pub fn spawn_item_backfill(storage: Arc<Storage>, embedder: SharedEmbedder) {
+    tokio::task::spawn_blocking(move || {
+        let ids = match storage.workspace_ids_missing_items() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(error = %e, "item backfill worklist failed");
+                return;
+            }
+        };
+        if ids.is_empty() {
+            return;
+        }
+        info!(count = ids.len(), "backfilling items/groups for pre-existing workspaces");
+        for workspace_id in ids {
+            let run = || -> anyhow::Result<()> {
+                let Some(record) = storage.get_workspace(&workspace_id)? else {
+                    return Ok(()); // deleted in the meantime
+                };
+                let mut workspace = workspace_from_wire(&record.payload_json)
+                    .map_err(|e| anyhow::anyhow!("stored payload undecodable: {e}"))?;
+                let items = grouping::items_for(&workspace);
+                let mut guard = embedder.lock().expect("embedder mutex poisoned");
+                let mut vectors = Vec::with_capacity(items.len());
+                for item in &items {
+                    vectors.push(guard.embed_document(&item.embed_text)?);
+                }
+                drop(guard);
+                if workspace.groups.is_empty() {
+                    workspace.groups = grouping::build_groups(&items, &vectors);
+                }
+                let item_rows: Vec<(ItemRecord, Vec<f32>)> = items
+                    .iter()
+                    .zip(vectors)
+                    .map(|(item, vector)| {
+                        (item_record(&workspace_id, workspace.captured_at_unix_ms, item), vector)
+                    })
+                    .collect();
+                let updated = WorkspaceRecord {
+                    workspace_id: workspace_id.clone(),
+                    captured_at_unix_ms: record.captured_at_unix_ms,
+                    summary: workspace.summary.clone(),
+                    tags_json: tags_to_wire(&workspace),
+                    payload_json: workspace_to_wire(&workspace),
+                };
+                storage.upsert_workspace(&updated)?;
+                storage.replace_items(&workspace_id, &item_rows)?;
+                Ok(())
+            };
+            if let Err(e) = run() {
+                warn!(workspace_id, error = %e, "item backfill failed for workspace");
+            }
+        }
+        info!("item backfill complete");
+    });
+}
+
+/// How many raw item hits to pull before dedup/thresholding.
+const ITEM_SEARCH_POOL: usize = 48;
+/// Items scoring below this never enter an assembled workspace — better no
+/// assembled candidate than one padded with weak matches.
+const MIN_ASSEMBLED_SCORE: f64 = 0.55;
+/// Items must also land within this margin of the query's best item: bge
+/// similarity is only meaningful relative to the query (a vague query's top
+/// hit may score ~0.6 where a sharp one's scores ~0.85), and off-topic items
+/// consistently sit well below on-topic ones. Measured on real embeddings:
+/// on-topic items cluster within ~0.17 of the top, off-topic ≥0.25 below.
+const ASSEMBLED_SCORE_MARGIN: f64 = 0.18;
+/// Upper bound on items in an assembled workspace.
+const MAX_ASSEMBLED_ITEMS: usize = 10;
+
+fn item_record(
+    workspace_id: &str,
+    captured_at_unix_ms: i64,
+    item: &grouping::WorkspaceItem,
+) -> ItemRecord {
+    ItemRecord {
+        workspace_id: workspace_id.to_string(),
+        node_id: item.item_ref.node_id.clone(),
+        tab_index: item.item_ref.tab_index.map(i64::from),
+        kind: item.kind.as_str().to_string(),
+        dedup_key: item.dedup_key.clone(),
+        title: item.title.clone(),
+        captured_at_unix_ms,
+    }
+}
+
+/// Builds the full candidate list for one query. Non-empty query + embedder:
+/// workspace KNN plus a prompt-assembled virtual workspace from item search.
+/// Otherwise: recency order (score 0), with each workspace's stored groups
+/// materialized as selectable sub-candidates on the empty-query main menu.
+fn build_candidates(
+    storage: &Storage,
+    embedder: Option<&SharedEmbedder>,
+    text: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<QueryCandidate>> {
+    let trimmed = text.trim();
+    let query_vector = match (embedder, trimmed.is_empty()) {
+        (Some(embedder), false) => {
+            Some(embedder.lock().expect("embedder mutex poisoned").embed_query(trimmed)?)
+        }
+        _ => None,
+    };
+
+    let Some(vector) = query_vector else {
+        let mut candidates = Vec::new();
+        for record in storage.list_workspaces()?.into_iter().take(limit) {
+            let Some(workspace) = decode_payload(&record) else { continue };
+            let groups = if trimmed.is_empty() { workspace.groups.clone() } else { Vec::new() };
+            let source_id = workspace.workspace_id.clone();
+            candidates.push(QueryCandidate {
+                workspace,
+                score: 0.0,
+                kind: CandidateKind::Workspace,
+                source_workspace_id: None,
+            });
+            if groups.len() >= 2 {
+                let parent = &candidates.last().expect("just pushed").workspace;
+                let materialized: Vec<QueryCandidate> = groups
+                    .iter()
+                    .filter_map(|group| grouping::materialize_group(parent, &group.group_id))
+                    .map(|workspace| QueryCandidate {
+                        workspace,
+                        score: 0.0,
+                        kind: CandidateKind::Group,
+                        source_workspace_id: Some(source_id.clone()),
+                    })
+                    .collect();
+                candidates.extend(materialized);
+            }
+        }
+        return Ok(candidates);
+    };
+
+    let mut candidates = Vec::new();
+    for (record, score) in storage.search_embeddings(&vector, limit)? {
+        let Some(workspace) = decode_payload(&record) else { continue };
+        candidates.push(QueryCandidate {
+            workspace,
+            score,
+            kind: CandidateKind::Workspace,
+            source_workspace_id: None,
+        });
+    }
+    if let Some(assembled) = assemble_candidate(storage, &vector, trimmed)? {
+        candidates.insert(0, assembled);
+    }
+    Ok(candidates)
+}
+
+/// Item-level search across every snapshot: dedup (freshest duplicate wins),
+/// threshold, and synthesize the survivors into one virtual workspace. None
+/// when fewer than two distinct items match well enough.
+fn assemble_candidate(
+    storage: &Storage,
+    vector: &[f32],
+    query_text: &str,
+) -> anyhow::Result<Option<QueryCandidate>> {
+    let hits = storage.search_items(vector, ITEM_SEARCH_POOL)?;
+
+    // Hits arrive best-first: the first occurrence of an identity fixes its
+    // rank, a fresher duplicate later only replaces the record behind it.
+    let top_score = hits.first().map(|(_, score)| *score).unwrap_or(0.0);
+    let cutoff = MIN_ASSEMBLED_SCORE.max(top_score - ASSEMBLED_SCORE_MARGIN);
+    let mut best: Vec<(ItemRecord, f64)> = Vec::new();
+    for (item, score) in hits {
+        if score < cutoff {
+            continue;
+        }
+        match best.iter_mut().find(|(kept, _)| kept.dedup_key == item.dedup_key) {
+            Some((kept, _)) => {
+                if item.captured_at_unix_ms > kept.captured_at_unix_ms {
+                    *kept = item;
+                }
+            }
+            None => best.push((item, score)),
+        }
+    }
+    best.truncate(MAX_ASSEMBLED_ITEMS);
+    if best.len() < 2 {
+        return Ok(None);
+    }
+
+    // Load each source snapshot once.
+    let mut sources: Vec<(String, WorkspaceState)> = Vec::new();
+    for (item, _) in &best {
+        if sources.iter().any(|(id, _)| id == &item.workspace_id) {
+            continue;
+        }
+        let Some(record) = storage.get_workspace(&item.workspace_id)? else { continue };
+        if let Some(workspace) = decode_payload(&record) {
+            sources.push((item.workspace_id.clone(), workspace));
+        }
+    }
+
+    let mut picks = Vec::new();
+    let mut used = 0usize;
+    let mut score_sum = 0.0;
+    for (item, score) in &best {
+        let Some((_, source)) = sources.iter().find(|(id, _)| id == &item.workspace_id) else {
+            continue;
+        };
+        let Some(node) = source.nodes.iter().find(|n| n.node_id == item.node_id) else {
+            warn!(workspace_id = %item.workspace_id, node_id = %item.node_id,
+                  "item row points at a node missing from its payload");
+            continue;
+        };
+        let mut node = node.clone();
+        // Snapshots reuse "n0", "n1", …; qualify so picks from different
+        // snapshots never merge as if they were one window.
+        node.node_id = format!("{}::{}", item.workspace_id, item.node_id);
+        picks.push(grouping::NodePick {
+            node,
+            tab_indices: item.tab_index.map(|index| vec![index as i32]),
+        });
+        used += 1;
+        score_sum += score;
+    }
+    let nodes = grouping::synthesize_nodes(picks);
+    if used < 2 || nodes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut workspace = WorkspaceState {
+        workspace_id: format!("virtual-{}", uuid::Uuid::new_v4()),
+        captured_at_unix_ms: unix_ms(),
+        summary: format!("Assembled · {used} items for \"{query_text}\""),
+        tags: Vec::new(),
+        nodes,
+        groups: Vec::new(),
+    };
+    workspace.tags = tagging::derive_tags(&workspace);
+    Ok(Some(QueryCandidate {
+        workspace,
+        score: score_sum / used as f64,
+        kind: CandidateKind::Assembled,
+        source_workspace_id: None,
+    }))
+}
+
+fn decode_payload(record: &WorkspaceRecord) -> Option<WorkspaceState> {
+    match workspace_from_wire(&record.payload_json) {
+        Ok(workspace) => Some(workspace),
+        Err(e) => {
+            // A payload we wrote that no longer decodes is a bug, not a user
+            // error; surface loudly but keep serving the rest.
+            warn!(workspace_id = %record.workspace_id, error = %e, "stored payload failed to decode");
+            None
+        }
+    }
 }
