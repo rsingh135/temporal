@@ -55,6 +55,13 @@ async fn main() -> Result<()> {
         Command::Run { db } => {
             let db_path = db.unwrap_or_else(|| app_dir.join("temporal.db"));
             std::fs::create_dir_all(&app_dir)?;
+            // Owner-only: the dir holds the socket, the SQLite DB, and models.
+            // Set explicitly in case an earlier run created it with a looser
+            // mode; the socket's own 0600 is enforced separately in the IPC layer.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700))?;
+            }
             let storage = Arc::new(Storage::open(&db_path)?);
             let embedder = match temporal_semantic::Embedder::load(
                 &app_dir.join("models/bge-small-en-v1.5"),
