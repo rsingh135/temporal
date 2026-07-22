@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned so CI and contributors build with the same compiler. Edition 2024
+# needs >= 1.85; this is the version the project is developed against.
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
