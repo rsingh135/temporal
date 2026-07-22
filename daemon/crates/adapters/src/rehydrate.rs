@@ -125,7 +125,9 @@ fn rehydrate_node(node: &WindowNode) -> Result<(), String> {
             rehydrate_chrome(node, tabs, *active_tab_index)
         }
         NodePayload::Terminal { tabs } => rehydrate_terminal(node, tabs),
-        NodePayload::Editor { folder_path, .. } => rehydrate_editor(node, folder_path),
+        NodePayload::Editor { folder_path, open_files } => {
+            rehydrate_editor(node, folder_path, open_files)
+        }
         NodePayload::Generic => rehydrate_generic(node),
     }
 }
@@ -209,7 +211,11 @@ JSON.stringify("ok");
     Ok(())
 }
 
-fn rehydrate_editor(node: &WindowNode, folder_path: &str) -> Result<(), String> {
+fn rehydrate_editor(
+    node: &WindowNode,
+    folder_path: &str,
+    open_files: &[String],
+) -> Result<(), String> {
     // `--` stops `open` from parsing a folder_path that begins with `-` as a
     // flag (no shell is involved, so this is argument-injection hardening only).
     let status = Command::new("/usr/bin/open")
@@ -218,6 +224,26 @@ fn rehydrate_editor(node: &WindowNode, folder_path: &str) -> Result<(), String> 
         .map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!("open -a {} exited with {status}", node.app_name));
+    }
+    // Reopen the previously-open files in the just-restored window. `-g` keeps
+    // the editor from stealing focus per file; VS Code / Cursor add each file
+    // to the folder's window. Best-effort: a failure here doesn't fail the node
+    // (the folder is already open), it's just logged.
+    if !open_files.is_empty() {
+        let mut cmd = Command::new("/usr/bin/open");
+        cmd.args(["-a", &node.app_name, "-g", "--"]);
+        cmd.args(open_files);
+        match proc_timeout::run_with_timeout(cmd, OPEN_TIMEOUT) {
+            Ok(output) if !output.status.success() => {
+                warn!(
+                    app = %node.app_name,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "reopening editor files failed"
+                );
+            }
+            Err(e) => warn!(app = %node.app_name, error = %e, "reopening editor files failed"),
+            Ok(_) => {}
+        }
     }
     Ok(())
 }
