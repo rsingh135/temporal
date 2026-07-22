@@ -10,12 +10,44 @@ use temporal_domain::wire::{
     request_from_wire, response_to_wire, tags_to_wire, workspace_from_wire, workspace_to_wire,
 };
 use temporal_domain::{
-    grouping, planning, tagging, CandidateKind, IpcRequest, IpcResponse, QueryCandidate,
-    RehydrationPayload, WorkspaceState,
+    grouping, planning, tagging, CandidateKind, IpcRequest, IpcResponse, NodePayload,
+    QueryCandidate, RehydrationPayload, WorkspaceState,
 };
 use temporal_ipc::{Handler, Responder};
 use temporal_storage::{ItemRecord, Storage, WorkspaceRecord};
 use tracing::{info, warn};
+
+/// Upper bounds on a rehydration payload. A real desktop is a few dozen
+/// windows with a few dozen tabs each; these are generous but reject
+/// pathological client payloads before any subprocess/JXA work.
+const MAX_REHYDRATE_NODES: usize = 200;
+const MAX_TABS_PER_NODE: usize = 500;
+
+/// Rejects an oversized rehydration payload. Content is not otherwise
+/// validated — see the trust-boundary note in SECURITY.md.
+fn validate_payload_size(payload: &RehydrationPayload) -> Result<(), String> {
+    let nodes = &payload.workspace.nodes;
+    if nodes.len() > MAX_REHYDRATE_NODES {
+        return Err(format!(
+            "payload has {} nodes; maximum is {MAX_REHYDRATE_NODES}",
+            nodes.len()
+        ));
+    }
+    for node in nodes {
+        let tabs = match &node.payload {
+            NodePayload::Browser { tabs, .. } => tabs.len(),
+            NodePayload::Terminal { tabs } => tabs.len(),
+            NodePayload::Editor { .. } | NodePayload::Generic => 0,
+        };
+        if tabs > MAX_TABS_PER_NODE {
+            return Err(format!(
+                "node {:?} has {tabs} tabs; maximum is {MAX_TABS_PER_NODE}",
+                node.node_id
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// The ort session is not Sync; a std Mutex serializes embeddings (they take
 /// ~10ms and happen once per freeze/query).
@@ -254,6 +286,13 @@ impl DaemonHandler {
     }
 
     async fn handle_rehydrate(&self, payload: RehydrationPayload, responder: Responder) {
+        // The payload is client-supplied and not checked against storage
+        // (synthesized Group/Assembled candidates never persist verbatim), so
+        // cap its size to bound resource use / JXA-script generation before any
+        // work. The real trust boundary is the owner-only socket (see SECURITY.md).
+        if let Err(msg) = validate_payload_size(&payload) {
+            return Self::error(&responder, "E_INVALID", msg).await;
+        }
         Self::respond(&responder, IpcResponse::RehydrateStarted).await;
         let nodes = planning::included_nodes(&payload.workspace, &payload.excluded_node_ids);
         let total = nodes.len();
@@ -625,5 +664,60 @@ fn decode_payload(record: &WorkspaceRecord) -> Option<WorkspaceState> {
             warn!(workspace_id = %record.workspace_id, error = %e, "stored payload failed to decode");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temporal_domain::{
+        AdapterKind, BrowserTab, RehydrationPayload, WindowGeometry, WindowNode, WorkspaceState,
+    };
+
+    fn browser_node(id: &str, tab_count: usize) -> WindowNode {
+        WindowNode {
+            node_id: id.into(),
+            bundle_id: "com.google.Chrome".into(),
+            app_name: "Google Chrome".into(),
+            window_title: String::new(),
+            geometry: WindowGeometry::default(),
+            adapter: AdapterKind::Chrome,
+            payload: NodePayload::Browser {
+                tabs: vec![BrowserTab { url: "https://x".into(), title: String::new() }; tab_count],
+                active_tab_index: 0,
+            },
+        }
+    }
+
+    fn payload(nodes: Vec<WindowNode>) -> RehydrationPayload {
+        RehydrationPayload {
+            workspace: WorkspaceState {
+                workspace_id: "w".into(),
+                captured_at_unix_ms: 0,
+                summary: String::new(),
+                tags: Vec::new(),
+                nodes,
+                groups: Vec::new(),
+            },
+            excluded_node_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_a_normal_payload() {
+        let nodes = (0..10).map(|i| browser_node(&i.to_string(), 20)).collect();
+        assert!(validate_payload_size(&payload(nodes)).is_ok());
+    }
+
+    #[test]
+    fn rejects_too_many_nodes() {
+        let nodes = (0..MAX_REHYDRATE_NODES + 1).map(|i| browser_node(&i.to_string(), 0)).collect();
+        assert!(validate_payload_size(&payload(nodes)).is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_tabs_in_one_node() {
+        let node = browser_node("big", MAX_TABS_PER_NODE + 1);
+        assert!(validate_payload_size(&payload(vec![node])).is_err());
     }
 }
