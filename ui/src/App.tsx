@@ -6,6 +6,7 @@ import type { IpcResponse } from "./gen/IpcResponse";
 import type { QueryCandidate } from "./gen/QueryCandidate";
 import type { WindowNode } from "./gen/WindowNode";
 import type { AdapterKind } from "./gen/AdapterKind";
+import type { PreflightNode } from "./gen/PreflightNode";
 import { relativeAge, scorePercent } from "./format";
 
 // ---------------------------------------------------------------------------
@@ -107,9 +108,16 @@ function NodeRow(props: {
     node: WindowNode;
     excluded: boolean;
     focused: boolean;
+    preflight?: PreflightNode;
     onToggle: () => void;
 }) {
-    const classes = ["node", props.excluded && "excluded", props.focused && "focused"]
+    const issues = props.preflight?.issues ?? [];
+    const classes = [
+        "node",
+        props.excluded && "excluded",
+        props.focused && "focused",
+        issues.length > 0 && "has-issues",
+    ]
         .filter(Boolean)
         .join(" ");
     return (
@@ -121,6 +129,11 @@ function NodeRow(props: {
                     {props.node.appName} — {props.node.windowTitle}
                 </span>
                 <span className="node-detail">{nodeDetail(props.node)}</span>
+                {issues.map((issue, i) => (
+                    <span className="node-issue" key={i}>
+                        ⚠ {issue}
+                    </span>
+                ))}
             </div>
         </label>
     );
@@ -143,6 +156,7 @@ export function App() {
     const [searching, setSearching] = useState(false);
     const [phase, setPhase] = useState<Phase>({ kind: "searching" });
     const [excluded, setExcluded] = useState<Set<string>>(new Set());
+    const [preview, setPreview] = useState<Map<string, PreflightNode>>(new Map());
     const [selectedIndex, setSelectedIndex] = useState(0);
     const [stagingIndex, setStagingIndex] = useState(0);
     const [permissions, setPermissions] = useState<{
@@ -296,7 +310,24 @@ export function App() {
     const stage = (candidate: QueryCandidate) => {
         setExcluded(new Set());
         setStagingIndex(0);
+        setPreview(new Map());
         setPhase({ kind: "staging", candidate });
+        // Dry-run what rehydration would do so the staging list can warn about
+        // missing apps / moved windows / skipped tabs. Best-effort: issues are
+        // per-node and independent of exclusions, so preview the full set once.
+        sendRequest({
+            type: "rehydrate-preview",
+            payload: { workspace: candidate.workspace, excludedNodeIds: [] },
+        })
+            .then((responses) => {
+                const last = responses[responses.length - 1];
+                if (last?.type === "rehydrate-preview") {
+                    setPreview(new Map(last.nodes.map((n) => [n.nodeId, n])));
+                }
+            })
+            .catch(() => {
+                /* preview is advisory; rehydrate still works without it */
+            });
     };
 
     const toggleExcluded = (nodeId: string) => {
@@ -399,6 +430,7 @@ export function App() {
                                 node={node}
                                 excluded={excluded.has(node.nodeId)}
                                 focused={i === stagingIndex}
+                                preflight={preview.get(node.nodeId)}
                                 onToggle={() => toggleExcluded(node.nodeId)}
                             />
                         ))}

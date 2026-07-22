@@ -13,7 +13,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::json;
-use temporal_domain::{BrowserTab, NodePayload, TerminalTab, WindowGeometry, WindowNode};
+use temporal_domain::{
+    BrowserTab, NodePayload, PreflightNode, TerminalTab, WindowGeometry, WindowNode,
+};
 use tracing::{info, warn};
 
 use crate::osascript::run_jxa_json_retrying;
@@ -105,6 +107,52 @@ pub fn rehydrate_nodes(nodes: &[WindowNode], mut on_event: impl FnMut(NodeEvent)
         }
     }
     outcome
+}
+
+/// Dry-runs rehydration for each node: reports whether the app looks installed,
+/// whether the window would be repositioned, and how many tabs would be skipped
+/// — without launching anything. Uses the same predicates as the real
+/// rehydration so the preview matches the outcome.
+pub fn preflight_nodes(nodes: &[WindowNode]) -> Vec<PreflightNode> {
+    nodes.iter().map(preflight_node).collect()
+}
+
+fn preflight_node(node: &WindowNode) -> PreflightNode {
+    let installed = looks_like_bundle_id(&node.bundle_id) && bundle_is_installed(&node.bundle_id);
+
+    let (cx, cy, cw, ch) = clamped_frame(node);
+    let g = &node.geometry;
+    let geometry_clamped = (cx, cy, cw, ch) != (g.x, g.y, g.width, g.height);
+
+    let (total_tabs, skipped_tabs) = match &node.payload {
+        NodePayload::Browser { tabs, .. } => (
+            tabs.len(),
+            tabs.iter().filter(|t| !is_allowed_url(&t.url)).count(),
+        ),
+        _ => (0, 0),
+    };
+
+    let mut issues = Vec::new();
+    if !installed {
+        issues.push(format!("{} is not installed — will be skipped", node.app_name));
+    }
+    if geometry_clamped {
+        issues.push("window will be repositioned onto an active display".to_string());
+    }
+    if skipped_tabs > 0 {
+        issues.push(format!("{skipped_tabs} tab(s) with a disallowed URL scheme will be skipped"));
+    }
+
+    PreflightNode {
+        node_id: node.node_id.clone(),
+        app_name: node.app_name.clone(),
+        adapter: node.adapter,
+        installed,
+        geometry_clamped,
+        total_tabs: total_tabs as u32,
+        skipped_tabs: skipped_tabs as u32,
+        issues,
+    }
 }
 
 /// Clamps a captured node's geometry to fit within a currently active

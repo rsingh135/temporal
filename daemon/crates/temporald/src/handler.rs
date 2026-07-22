@@ -335,6 +335,20 @@ impl DaemonHandler {
         }
     }
 
+    async fn handle_rehydrate_preview(&self, payload: RehydrationPayload, responder: Responder) {
+        if let Err(msg) = validate_payload_size(&payload) {
+            return Self::error(&responder, "E_INVALID", msg).await;
+        }
+        let nodes = planning::included_nodes(&payload.workspace, &payload.excluded_node_ids);
+        let previewed =
+            tokio::task::spawn_blocking(move || temporal_adapters::rehydrate::preflight_nodes(&nodes))
+                .await;
+        match previewed {
+            Ok(nodes) => Self::respond(&responder, IpcResponse::RehydratePreview { nodes }).await,
+            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
+        }
+    }
+
     async fn handle_permission_status(&self, responder: Responder) {
         let screen_recording = temporal_macos_ffi::permissions::preflight().screen_recording;
         let accessibility = temporal_macos_ffi::ax::is_trusted();
@@ -386,6 +400,9 @@ impl DaemonHandler {
             IpcRequest::Freeze => self.handle_freeze(responder).await,
             IpcRequest::Query { text, limit } => self.handle_query(text, limit, responder).await,
             IpcRequest::Rehydrate { payload } => self.handle_rehydrate(payload, responder).await,
+            IpcRequest::RehydratePreview { payload } => {
+                self.handle_rehydrate_preview(payload, responder).await
+            }
             IpcRequest::PermissionStatus => self.handle_permission_status(responder).await,
             IpcRequest::Prune { older_than_unix_ms, keep_latest } => {
                 self.handle_prune(older_than_unix_ms, keep_latest, responder).await

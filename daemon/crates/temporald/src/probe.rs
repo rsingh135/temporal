@@ -110,6 +110,10 @@ pub async fn run_probe(socket_path: &Path, command: ProbeCommand) -> Result<()> 
                 eprintln!("screen recording: {screen_recording}, accessibility: {accessibility}");
                 break;
             }
+            IpcResponse::RehydratePreview { nodes } => {
+                eprintln!("({} nodes previewed)", nodes.len());
+                break;
+            }
             IpcResponse::FreezeStarted { .. }
             | IpcResponse::RehydrateStarted
             | IpcResponse::Progress { .. }
