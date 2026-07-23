@@ -31,6 +31,12 @@ enum Command {
         /// Omit to only freeze on explicit request.
         #[arg(long, value_name = "MINUTES")]
         interval: Option<u64>,
+        /// Embedding model directory (default: <app dir>/models/bge-small-en-v1.5).
+        #[arg(long)]
+        embedder_path: Option<PathBuf>,
+        /// Tagging model .gguf (default: <app dir>/models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf).
+        #[arg(long)]
+        tagger_path: Option<PathBuf>,
     },
     /// Send a single request to a running daemon and print the responses.
     Probe {
@@ -55,8 +61,13 @@ async fn main() -> Result<()> {
     let app_dir = app_dir()?;
     let socket_path = cli.socket.unwrap_or_else(|| app_dir.join("temporald.sock"));
 
-    match cli.command.unwrap_or(Command::Run { db: None, interval: None }) {
-        Command::Run { db, interval } => {
+    match cli.command.unwrap_or(Command::Run {
+        db: None,
+        interval: None,
+        embedder_path: None,
+        tagger_path: None,
+    }) {
+        Command::Run { db, interval, embedder_path, tagger_path } => {
             let db_path = db.unwrap_or_else(|| app_dir.join("temporal.db"));
             std::fs::create_dir_all(&app_dir)?;
             // Owner-only: the dir holds the socket, the SQLite DB, and models.
@@ -67,18 +78,18 @@ async fn main() -> Result<()> {
                 std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700))?;
             }
             let storage = Arc::new(Storage::open(&db_path)?);
-            let embedder = match temporal_semantic::Embedder::load(
-                &app_dir.join("models/bge-small-en-v1.5"),
-            ) {
+            let embedder_path =
+                embedder_path.unwrap_or_else(|| app_dir.join("models/bge-small-en-v1.5"));
+            let tagger_path = tagger_path
+                .unwrap_or_else(|| app_dir.join("models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf"));
+            let embedder = match temporal_semantic::Embedder::load(&embedder_path) {
                 Ok(embedder) => Some(Arc::new(std::sync::Mutex::new(embedder))),
                 Err(e) => {
                     tracing::warn!(error = %e, "semantic search disabled (recency fallback)");
                     None
                 }
             };
-            let tagger = match temporal_semantic::Tagger::load(
-                &app_dir.join("models/qwen3-1.7b/Qwen3-1.7B-Q8_0.gguf"),
-            ) {
+            let tagger = match temporal_semantic::Tagger::load(&tagger_path) {
                 Ok(tagger) => Some(Arc::new(std::sync::Mutex::new(tagger))),
                 Err(e) => {
                     tracing::warn!(error = %e, "llm tagging disabled (heuristic tags only)");

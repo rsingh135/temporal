@@ -15,7 +15,18 @@ use temporal_domain::{
 };
 use temporal_ipc::{Handler, Responder};
 use temporal_storage::{ItemRecord, Storage, WorkspaceRecord};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Watches a detached `spawn_blocking` task and logs if it *panicked* — the
+/// tasks log their own returned errors, but a panic would otherwise vanish
+/// silently because the JoinHandle is dropped.
+fn supervise(handle: tokio::task::JoinHandle<()>, name: &'static str) {
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            error!(task = name, error = %e, "detached task panicked");
+        }
+    });
+}
 
 /// Upper bounds on a rehydration payload. A real desktop is a few dozen
 /// windows with a few dozen tabs each; these are generous but reject
@@ -264,7 +275,7 @@ impl DaemonHandler {
         let Some(tagger) = self.tagger.clone() else { return };
         let storage = Arc::clone(&self.storage);
         let embedder = self.embedder.clone();
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             let run = || -> anyhow::Result<()> {
                 let Some(record) = storage.get_workspace(&workspace_id)? else {
                     return Ok(()); // deleted/overwritten in the meantime
@@ -328,6 +339,7 @@ impl DaemonHandler {
                 warn!(error = %e, "llm enrichment failed; heuristic tags kept");
             }
         });
+        supervise(handle, "llm enrichment");
     }
 
     async fn handle_query(&self, text: String, limit: i32, responder: Responder) {
@@ -498,7 +510,7 @@ pub fn unix_ms() -> i64 {
 // compiles this file without main.rs, so allow the false "unused" there.
 #[allow(dead_code)]
 pub fn spawn_item_backfill(storage: Arc<Storage>, embedder: SharedEmbedder) {
-    tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         let ids = match storage.workspace_ids_missing_items() {
             Ok(ids) => ids,
             Err(e) => {
@@ -551,6 +563,7 @@ pub fn spawn_item_backfill(storage: Arc<Storage>, embedder: SharedEmbedder) {
         }
         info!("item backfill complete");
     });
+    supervise(handle, "item backfill");
 }
 
 /// How many raw item hits to pull before dedup/thresholding.
