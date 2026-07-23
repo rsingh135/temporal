@@ -3,6 +3,7 @@ name = "temporal-adapters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 temporal-macos-ffi = { path = "../macos-ffi" }

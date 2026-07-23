@@ -3,6 +3,7 @@ name = "temporal-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"] }
