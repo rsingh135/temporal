@@ -1,6 +1,6 @@
 //! Tauri shell: global hotkey, frameless panel, and a passthrough to the
 //! daemon's Unix socket. The shell never interprets the JSON it ferries —
-//! both ends speak the shared F# codec.
+//! both ends speak the shared serde codec in temporal-domain.
 
 use std::path::PathBuf;
 
