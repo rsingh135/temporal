@@ -69,7 +69,7 @@ fn enclosing_app_bundle(exe: &Path) -> Option<PathBuf> {
     outermost
 }
 
-fn read_bundle_identity(bundle_root: &Path) -> Option<AppIdentity> {
+pub(crate) fn read_bundle_identity(bundle_root: &Path) -> Option<AppIdentity> {
     let info = plist::Value::from_file(bundle_root.join("Contents/Info.plist")).ok()?;
     let dict = info.as_dictionary()?;
     let bundle_id = dict.get("CFBundleIdentifier")?.as_string()?.to_string();

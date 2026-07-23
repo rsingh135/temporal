@@ -10,11 +10,11 @@ use temporal_domain::wire::{
     request_from_wire, response_to_wire, tags_to_wire, workspace_from_wire, workspace_to_wire,
 };
 use temporal_domain::{
-    grouping, planning, tagging, CandidateKind, IpcRequest, IpcResponse, NodePayload,
-    QueryCandidate, RehydrationPayload, WorkspaceState,
+    catalog, grouping, planning, tagging, AdapterKind, CandidateKind, IpcRequest, IpcResponse,
+    NodePayload, QueryCandidate, RehydrationPayload, WindowGeometry, WindowNode, WorkspaceState,
 };
 use temporal_ipc::{Handler, Responder};
-use temporal_storage::{ItemRecord, Storage, WorkspaceRecord};
+use temporal_storage::{AppCatalogRecord, ItemRecord, Storage, WorkspaceRecord};
 use tracing::{error, info, warn};
 
 /// Watches a detached `spawn_blocking` task and logs if it *panicked* — the
@@ -359,6 +359,27 @@ impl DaemonHandler {
         }
     }
 
+    /// Intent synthesis: assemble a workspace for a stated intent from the live
+    /// desktop, history, and installed apps — the forward-looking counterpart to
+    /// `handle_query`'s retrieval. Blocking work (live desktop capture, embedding,
+    /// LLM capability inference) runs off the reactor.
+    async fn handle_summon(&self, text: String, responder: Responder) {
+        let storage = Arc::clone(&self.storage);
+        let embedder = self.embedder.clone();
+        let tagger = self.tagger.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            build_summon_candidates(&storage, embedder.as_ref(), tagger.as_ref(), &text)
+        })
+        .await;
+        match built {
+            Ok(Ok(candidates)) => {
+                Self::respond(&responder, IpcResponse::QueryResults { candidates }).await
+            }
+            Ok(Err(e)) => Self::error(&responder, "E_STORAGE", e).await,
+            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
+        }
+    }
+
     async fn handle_rehydrate(&self, payload: RehydrationPayload, responder: Responder) {
         // The payload is client-supplied and not checked against storage
         // (synthesized Group/Assembled candidates never persist verbatim), so
@@ -473,6 +494,7 @@ impl DaemonHandler {
             IpcRequest::Ping => Self::respond(&responder, IpcResponse::Pong).await,
             IpcRequest::Freeze => self.handle_freeze(responder).await,
             IpcRequest::Query { text, limit } => self.handle_query(text, limit, responder).await,
+            IpcRequest::SummonIntent { text } => self.handle_summon(text, responder).await,
             IpcRequest::Rehydrate { payload } => self.handle_rehydrate(payload, responder).await,
             IpcRequest::RehydratePreview { payload } => {
                 self.handle_rehydrate_preview(payload, responder).await
@@ -566,6 +588,57 @@ pub fn spawn_item_backfill(storage: Arc<Storage>, embedder: SharedEmbedder) {
     supervise(handle, "item backfill");
 }
 
+/// Detached startup reconciliation of the installed-app catalog: scans the
+/// application directories, drops entries for apps that were uninstalled, and
+/// embeds only newly-installed apps (embeddings are deterministic from the
+/// name + seed capabilities, so unchanged apps are skipped — the first run
+/// embeds everything, later runs are near-free). Feeds Summon's speculative
+/// launches. Failures only log; Summon degrades to history + live desktop.
+// Called by the binary (main.rs); the `#[path]` integration-test include
+// compiles this file without main.rs, so allow the false "unused" there.
+#[allow(dead_code)]
+pub fn spawn_catalog_sync(storage: Arc<Storage>, embedder: SharedEmbedder) {
+    let handle = tokio::task::spawn_blocking(move || {
+        let run = || -> anyhow::Result<()> {
+            let installed = temporal_macos_ffi::catalog::scan_installed_apps();
+            let scanned: std::collections::HashSet<String> =
+                installed.iter().map(|a| a.bundle_id.clone()).collect();
+            let stored = storage.app_catalog_bundle_ids()?;
+
+            for gone in stored.difference(&scanned) {
+                storage.delete_app_catalog_entry(gone)?;
+            }
+            let fresh: Vec<_> = installed.iter().filter(|a| !stored.contains(&a.bundle_id)).collect();
+            if fresh.is_empty() {
+                return Ok(());
+            }
+            info!(count = fresh.len(), "embedding newly-installed apps into catalog");
+            for app in fresh {
+                let capabilities: Vec<String> = catalog::seed_capabilities(&app.bundle_id)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                let embed_text = catalog::catalog_embed_text(&app.app_name, &capabilities);
+                let vector =
+                    embedder.lock().expect("embedder mutex poisoned").embed_document(&embed_text)?;
+                let record = AppCatalogRecord {
+                    bundle_id: app.bundle_id.clone(),
+                    app_name: app.app_name.clone(),
+                    capabilities_json: serde_json::to_string(&capabilities)?,
+                    embed_text,
+                };
+                storage.upsert_app_catalog_entry(&record, &vector)?;
+            }
+            info!("app catalog sync complete");
+            Ok(())
+        };
+        if let Err(e) = run() {
+            warn!(error = %e, "app catalog sync failed; summon uses history + live desktop only");
+        }
+    });
+    supervise(handle, "app catalog sync");
+}
+
 /// How many raw item hits to pull before dedup/thresholding.
 const ITEM_SEARCH_POOL: usize = 48;
 /// Items scoring below this never enter an assembled workspace — better no
@@ -625,6 +698,7 @@ fn build_candidates(
                 score: 0.0,
                 kind: CandidateKind::Workspace,
                 source_workspace_id: None,
+                speculative_node_ids: Vec::new(),
             });
             if groups.len() >= 2 {
                 let parent = &candidates.last().expect("just pushed").workspace;
@@ -636,6 +710,7 @@ fn build_candidates(
                         score: 0.0,
                         kind: CandidateKind::Group,
                         source_workspace_id: Some(source_id.clone()),
+                        speculative_node_ids: Vec::new(),
                     })
                     .collect();
                 candidates.extend(materialized);
@@ -652,6 +727,7 @@ fn build_candidates(
             score,
             kind: CandidateKind::Workspace,
             source_workspace_id: None,
+            speculative_node_ids: Vec::new(),
         });
     }
     if let Some(assembled) = assemble_candidate(storage, &vector, trimmed)? {
@@ -747,7 +823,281 @@ fn assemble_candidate(
         score: score_sum / used as f64,
         kind: CandidateKind::Assembled,
         source_workspace_id: None,
+        speculative_node_ids: Vec::new(),
     }))
+}
+
+/// Past snapshots surfaced alongside a Summoned candidate, so the user can pick
+/// "the real thing from last week" instead of the synthesis.
+const SUMMON_WORKSPACE_ALTERNATES: usize = 5;
+/// Catalog entries pulled by KNN before capability/threshold selection.
+const CATALOG_SEARCH_POOL: usize = 24;
+/// Most installed apps Summon will propose launching for one intent.
+const SUMMON_MAX_CATALOG_PICKS: usize = 3;
+/// Live-desktop items are noisier than cross-snapshot search — everything the
+/// user has open counts, including unrelated projects — so Summon holds item
+/// inclusion to a tighter absolute bar and margin than assembly, keeping the
+/// synthesized workspace focused on the intent. A stray high-scoring "hub" tab
+/// (bge maps some titles near many queries) can still slip through; the staging
+/// preview lets the user uncheck it. Verified live — do not tune tighter
+/// without checking multiple real desktops (synthetic tests pass where a real
+/// desktop fails).
+const SUMMON_MIN_ITEM_SCORE: f64 = 0.62;
+const SUMMON_ITEM_MARGIN: f64 = 0.12;
+
+/// A candidate item for the summoned workspace, from the live desktop or a
+/// stored snapshot, scored against the intent.
+struct ScoredPick {
+    score: f64,
+    /// Live picks win ties over historical ones: the open window is the truth.
+    from_live: bool,
+    dedup_key: String,
+    pick: grouping::NodePick,
+}
+
+/// Cosine similarity of two L2-normalized embeddings, clamped to [0, 1] to
+/// match the scores the sqlite-vec index returns.
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| (x * y) as f64).sum::<f64>().clamp(0.0, 1.0)
+}
+
+/// Builds the Summon response: a synthesized `Summoned` candidate (when the
+/// intent resolves to anything) followed by the closest past snapshots as
+/// alternates. With no embedder, degrades to the plain retrieval path.
+fn build_summon_candidates(
+    storage: &Storage,
+    embedder: Option<&SharedEmbedder>,
+    tagger: Option<&SharedTagger>,
+    text: &str,
+) -> anyhow::Result<Vec<QueryCandidate>> {
+    let trimmed = text.trim();
+    let (Some(embedder), false) = (embedder, trimmed.is_empty()) else {
+        return build_candidates(storage, embedder, text, SUMMON_WORKSPACE_ALTERNATES);
+    };
+
+    let query_vector =
+        embedder.lock().expect("embedder mutex poisoned").embed_query(trimmed)?;
+
+    // Closest past snapshots as alternates to the synthesis.
+    let mut candidates = Vec::new();
+    for (record, score) in storage.search_embeddings(&query_vector, SUMMON_WORKSPACE_ALTERNATES)? {
+        if let Some(workspace) = decode_payload(&record) {
+            candidates.push(QueryCandidate {
+                workspace,
+                score,
+                kind: CandidateKind::Workspace,
+                source_workspace_id: None,
+                speculative_node_ids: Vec::new(),
+            });
+        }
+    }
+
+    if let Some(summoned) =
+        compose_summoned(storage, embedder, tagger, &query_vector, trimmed)?
+    {
+        candidates.insert(0, summoned);
+    }
+    Ok(candidates)
+}
+
+/// Synthesizes one workspace for the intent: item picks from the live desktop
+/// and history (deduped, thresholded, tab-folded), plus speculative launches of
+/// installed apps the intent implies. None when nothing clears the bar.
+fn compose_summoned(
+    storage: &Storage,
+    embedder: &SharedEmbedder,
+    tagger: Option<&SharedTagger>,
+    query_vector: &[f32],
+    text: &str,
+) -> anyhow::Result<Option<QueryCandidate>> {
+    let mut pool: Vec<ScoredPick> = Vec::new();
+
+    // --- Live desktop: embed each open item, score against the intent. ---
+    let live = temporal_adapters::extract_workspace();
+    for warning in &live.warnings {
+        warn!(warning, "summon live-extraction warning");
+    }
+    let live_ws = WorkspaceState {
+        workspace_id: "live".into(),
+        captured_at_unix_ms: unix_ms(),
+        summary: String::new(),
+        tags: Vec::new(),
+        nodes: live.nodes,
+        groups: Vec::new(),
+    };
+    let live_items = grouping::items_for(&live_ws);
+    if !live_items.is_empty() {
+        let mut guard = embedder.lock().expect("embedder mutex poisoned");
+        for item in &live_items {
+            let vector = guard.embed_document(&item.embed_text)?;
+            if let Some(pick) = live_pick(&live_ws, &item.item_ref) {
+                pool.push(ScoredPick {
+                    score: cosine(query_vector, &vector),
+                    from_live: true,
+                    dedup_key: item.dedup_key.clone(),
+                    pick,
+                });
+            }
+        }
+    }
+
+    // --- History: item KNN across every snapshot. ---
+    let hits = storage.search_items(query_vector, ITEM_SEARCH_POOL)?;
+    let mut sources: Vec<(String, WorkspaceState)> = Vec::new();
+    for (item, score) in hits {
+        if !sources.iter().any(|(id, _)| id == &item.workspace_id)
+            && let Some(record) = storage.get_workspace(&item.workspace_id)?
+            && let Some(workspace) = decode_payload(&record)
+        {
+            sources.push((item.workspace_id.clone(), workspace));
+        }
+        let Some((_, source)) = sources.iter().find(|(id, _)| id == &item.workspace_id) else {
+            continue;
+        };
+        let Some(node) = source.nodes.iter().find(|n| n.node_id == item.node_id) else {
+            continue;
+        };
+        let mut node = node.clone();
+        // Qualify so picks from different snapshots never merge as one window.
+        node.node_id = format!("{}::{}", item.workspace_id, item.node_id);
+        pool.push(ScoredPick {
+            score,
+            from_live: false,
+            dedup_key: item.dedup_key.clone(),
+            pick: grouping::NodePick {
+                node,
+                tab_indices: item.tab_index.map(|index| vec![index as i32]),
+            },
+        });
+    }
+
+    // --- Dedup (live wins, else higher score), threshold, cap. ---
+    let picks = select_item_picks(pool);
+    let mut nodes = grouping::synthesize_nodes(picks);
+    let item_count = nodes.len();
+
+    // --- Catalog: apps to launch that the intent implies but aren't open. ---
+    let mut present = temporal_macos_ffi::bundle::running_bundle_ids();
+    for node in &nodes {
+        present.insert(node.bundle_id.clone());
+    }
+    let catalog_picks =
+        catalog_launch_picks(storage, tagger, query_vector, text, &present)?;
+    let mut speculative_node_ids = Vec::new();
+    for cand in &catalog_picks {
+        let node_id = format!("n{}", nodes.len());
+        speculative_node_ids.push(node_id.clone());
+        nodes.push(WindowNode {
+            node_id,
+            bundle_id: cand.bundle_id.clone(),
+            app_name: cand.app_name.clone(),
+            window_title: String::new(),
+            geometry: WindowGeometry::default(),
+            adapter: AdapterKind::Generic,
+            payload: NodePayload::Generic,
+        });
+    }
+
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+
+    let app_count = catalog_picks.len();
+    let apps_clause =
+        if app_count > 0 { format!(", {app_count} apps to open") } else { String::new() };
+    let mut workspace = WorkspaceState {
+        workspace_id: format!("summoned-{}", uuid::Uuid::new_v4()),
+        captured_at_unix_ms: unix_ms(),
+        summary: format!("Summoned for \"{text}\" · {item_count} items{apps_clause}"),
+        tags: Vec::new(),
+        nodes,
+        groups: Vec::new(),
+    };
+    workspace.tags = tagging::derive_tags(&workspace);
+    Ok(Some(QueryCandidate {
+        workspace,
+        score: 0.0,
+        kind: CandidateKind::Summoned,
+        source_workspace_id: None,
+        speculative_node_ids,
+    }))
+}
+
+/// A live item's node, id-qualified so it can't collide with historical picks.
+fn live_pick(live_ws: &WorkspaceState, item_ref: &temporal_domain::ItemRef) -> Option<grouping::NodePick> {
+    let mut node = live_ws.nodes.iter().find(|n| n.node_id == item_ref.node_id)?.clone();
+    node.node_id = format!("live::{}", item_ref.node_id);
+    Some(grouping::NodePick { node, tab_indices: item_ref.tab_index.map(|index| vec![index]) })
+}
+
+/// Dedups the scored pool by identity (live beats historical, then higher
+/// score), keeps only picks within the relevance margin of the best, and caps
+/// the count — reusing the assembled-workspace thresholds.
+fn select_item_picks(pool: Vec<ScoredPick>) -> Vec<grouping::NodePick> {
+    let mut best: Vec<ScoredPick> = Vec::new();
+    for cand in pool {
+        match best.iter_mut().find(|k| k.dedup_key == cand.dedup_key) {
+            Some(kept) => {
+                let better = (cand.from_live, cand.score) > (kept.from_live, kept.score);
+                if better {
+                    *kept = cand;
+                }
+            }
+            None => best.push(cand),
+        }
+    }
+    best.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    let top = best.first().map(|c| c.score).unwrap_or(0.0);
+    let cutoff = SUMMON_MIN_ITEM_SCORE.max(top - SUMMON_ITEM_MARGIN);
+    best.into_iter()
+        .filter(|c| c.score >= cutoff)
+        .take(MAX_ASSEMBLED_ITEMS)
+        .map(|c| c.pick)
+        .collect()
+}
+
+/// Selects installed apps to speculatively launch: KNN over the catalog, LLM
+/// capability inference (when a tagger is loaded), and the pure selection rule.
+fn catalog_launch_picks(
+    storage: &Storage,
+    tagger: Option<&SharedTagger>,
+    query_vector: &[f32],
+    text: &str,
+    present: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<catalog::CatalogCandidate>> {
+    let raw = storage.search_app_catalog(query_vector, CATALOG_SEARCH_POOL)?;
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inferred_caps = match tagger {
+        Some(tagger) => match tagger
+            .lock()
+            .expect("tagger mutex poisoned")
+            .infer_capabilities(text, catalog::CAPABILITIES)
+        {
+            Ok(caps) => caps,
+            Err(e) => {
+                warn!(error = %e, "capability inference failed; catalog uses embedding match only");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let candidates: Vec<catalog::CatalogCandidate> = raw
+        .into_iter()
+        .map(|(record, score)| catalog::CatalogCandidate {
+            bundle_id: record.bundle_id,
+            app_name: record.app_name,
+            capabilities: serde_json::from_str(&record.capabilities_json).unwrap_or_default(),
+            score,
+        })
+        .collect();
+    Ok(catalog::select_catalog_picks(
+        &candidates,
+        &inferred_caps,
+        present,
+        SUMMON_MAX_CATALOG_PICKS,
+    ))
 }
 
 fn decode_payload(record: &WorkspaceRecord) -> Option<WorkspaceState> {
@@ -814,5 +1164,41 @@ mod tests {
     fn rejects_too_many_tabs_in_one_node() {
         let node = browser_node("big", MAX_TABS_PER_NODE + 1);
         assert!(validate_payload_size(&payload(vec![node])).is_err());
+    }
+
+    fn generic_node(id: &str) -> WindowNode {
+        WindowNode {
+            node_id: id.into(),
+            bundle_id: "com.example.app".into(),
+            app_name: "App".into(),
+            window_title: String::new(),
+            geometry: WindowGeometry::default(),
+            adapter: AdapterKind::Generic,
+            payload: NodePayload::Generic,
+        }
+    }
+
+    fn scored(score: f64, from_live: bool, key: &str, id: &str) -> ScoredPick {
+        ScoredPick {
+            score,
+            from_live,
+            dedup_key: key.into(),
+            pick: grouping::NodePick { node: generic_node(id), tab_indices: None },
+        }
+    }
+
+    #[test]
+    fn select_item_picks_prefers_live_and_thresholds() {
+        let pool = vec![
+            scored(0.90, false, "A", "hist-a"), // historical A, high score
+            scored(0.72, true, "A", "live-a"),  // live A — wins dedup despite lower score
+            scored(0.80, false, "B", "hist-b"), // within margin of the top
+            scored(0.40, false, "C", "hist-c"), // below the relevance floor — dropped
+        ];
+        let picks = select_item_picks(pool);
+        let ids: Vec<&str> = picks.iter().map(|p| p.node.node_id.as_str()).collect();
+        // B (0.80) leads; A resolves to its live copy (0.72); C falls below the
+        // cutoff = max(0.62, 0.80 - 0.12) = 0.68.
+        assert_eq!(ids, vec!["hist-b", "live-a"]);
     }
 }

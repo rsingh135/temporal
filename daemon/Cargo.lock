@@ -1926,6 +1926,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "serde_json",
  "tempfile",
  "temporal-adapters",
  "temporal-domain",

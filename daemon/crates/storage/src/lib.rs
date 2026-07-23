@@ -32,6 +32,17 @@ pub struct WorkspaceRecord {
     pub payload_json: String,
 }
 
+/// One installed application in the capability catalog. `capabilities_json` is
+/// a JSON array of capability labels (see `temporal_domain::catalog`);
+/// `embed_text` is the text whose embedding lives in `vec_app_catalog`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppCatalogRecord {
+    pub bundle_id: String,
+    pub app_name: String,
+    pub capabilities_json: String,
+    pub embed_text: String,
+}
+
 /// One searchable item (a browser tab or a whole non-browser window) inside
 /// a stored workspace. Denormalized from the workspace payload for the item
 /// vector index; `tab_index = None` means the whole node.
@@ -74,6 +85,15 @@ CREATE TABLE IF NOT EXISTS items (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_items_workspace ON items(workspace_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
+    embedding FLOAT[384] distance_metric=cosine
+);
+CREATE TABLE IF NOT EXISTS app_catalog (
+    bundle_id         TEXT PRIMARY KEY,
+    app_name          TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    embed_text        TEXT NOT NULL
+) STRICT;
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_app_catalog USING vec0(
     embedding FLOAT[384] distance_metric=cosine
 );
 ";
@@ -394,6 +414,96 @@ impl Storage {
         )?;
         Ok(n > 0)
     }
+
+    /// Bundle ids currently in the app catalog. The daemon diffs this against a
+    /// fresh install scan to embed only newly-installed apps.
+    pub fn app_catalog_bundle_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().expect("storage mutex poisoned");
+        let mut stmt = conn.prepare("SELECT bundle_id FROM app_catalog")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = std::collections::HashSet::new();
+        for row in rows {
+            ids.insert(row?);
+        }
+        Ok(ids)
+    }
+
+    /// Inserts or updates one catalog entry and its embedding. `ON CONFLICT
+    /// DO UPDATE` keeps the row's rowid stable, so the shared-rowid vector row
+    /// only needs replacing in place.
+    pub fn upsert_app_catalog_entry(
+        &self,
+        record: &AppCatalogRecord,
+        embedding: &[f32],
+    ) -> Result<()> {
+        assert_eq!(embedding.len(), EMBEDDING_DIM, "embedding dimension mismatch");
+        let conn = self.conn.lock().expect("storage mutex poisoned");
+        conn.execute(
+            "INSERT INTO app_catalog (bundle_id, app_name, capabilities_json, embed_text)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(bundle_id) DO UPDATE SET
+                 app_name = excluded.app_name,
+                 capabilities_json = excluded.capabilities_json,
+                 embed_text = excluded.embed_text",
+            params![record.bundle_id, record.app_name, record.capabilities_json, record.embed_text],
+        )?;
+        let rowid: i64 = conn.query_row(
+            "SELECT rowid FROM app_catalog WHERE bundle_id = ?1",
+            params![record.bundle_id],
+            |row| row.get(0),
+        )?;
+        conn.execute("DELETE FROM vec_app_catalog WHERE rowid = ?1", params![rowid])?;
+        conn.execute(
+            "INSERT INTO vec_app_catalog (rowid, embedding) VALUES (?1, ?2)",
+            params![rowid, embedding_bytes(embedding)],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a catalog entry (e.g. an uninstalled app) and its vector.
+    pub fn delete_app_catalog_entry(&self, bundle_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("storage mutex poisoned");
+        conn.execute(
+            "DELETE FROM vec_app_catalog WHERE rowid =
+                 (SELECT rowid FROM app_catalog WHERE bundle_id = ?1)",
+            params![bundle_id],
+        )?;
+        conn.execute("DELETE FROM app_catalog WHERE bundle_id = ?1", params![bundle_id])?;
+        Ok(())
+    }
+
+    /// KNN over the app catalog; returns (record, score) with score in [0, 1].
+    pub fn search_app_catalog(
+        &self,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(AppCatalogRecord, f64)>> {
+        assert_eq!(query.len(), EMBEDDING_DIM, "embedding dimension mismatch");
+        let conn = self.conn.lock().expect("storage mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT a.bundle_id, a.app_name, a.capabilities_json, a.embed_text, v.distance
+             FROM vec_app_catalog v
+             JOIN app_catalog a ON a.rowid = v.rowid
+             WHERE v.embedding MATCH ?1 AND v.k = ?2
+             ORDER BY v.distance",
+        )?;
+        let bytes = embedding_bytes(query);
+        let rows = stmt.query_map(params![bytes, limit as i64], |row| {
+            let record = AppCatalogRecord {
+                bundle_id: row.get(0)?,
+                app_name: row.get(1)?,
+                capabilities_json: row.get(2)?,
+                embed_text: row.get(3)?,
+            };
+            let distance: f64 = row.get(4)?;
+            Ok((record, (1.0 - distance).clamp(0.0, 1.0)))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
 }
 
 fn embedding_bytes(embedding: &[f32]) -> Vec<u8> {
@@ -643,6 +753,44 @@ mod tests {
         assert_eq!(s.prune_keep_latest(1).unwrap(), 1);
         assert!(!s.has_items("oldest").unwrap());
         assert!(s.has_items("newest").unwrap());
+    }
+
+    fn catalog_record(bundle_id: &str, name: &str) -> AppCatalogRecord {
+        AppCatalogRecord {
+            bundle_id: bundle_id.to_string(),
+            app_name: name.to_string(),
+            capabilities_json: r#"["design"]"#.to_string(),
+            embed_text: format!("{name} design"),
+        }
+    }
+
+    #[test]
+    fn app_catalog_upsert_search_and_delete() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(s.app_catalog_bundle_ids().unwrap().is_empty());
+
+        s.upsert_app_catalog_entry(&catalog_record("com.figma.Desktop", "Figma"), &unit_vec(0))
+            .unwrap();
+        s.upsert_app_catalog_entry(&catalog_record("com.apple.Music", "Music"), &unit_vec(1))
+            .unwrap();
+        assert_eq!(s.app_catalog_bundle_ids().unwrap().len(), 2);
+
+        // Upsert keeps the rowid stable and replaces the vector in place.
+        let mut renamed = catalog_record("com.figma.Desktop", "Figma");
+        renamed.app_name = "Figma Beta".to_string();
+        s.upsert_app_catalog_entry(&renamed, &unit_vec(2)).unwrap();
+        assert_eq!(s.app_catalog_bundle_ids().unwrap().len(), 2);
+
+        let hits = s.search_app_catalog(&unit_vec(2), 5).unwrap();
+        assert_eq!(hits[0].0.bundle_id, "com.figma.Desktop");
+        assert_eq!(hits[0].0.app_name, "Figma Beta");
+        assert!(hits[0].1 > 0.9);
+
+        s.delete_app_catalog_entry("com.figma.Desktop").unwrap();
+        assert_eq!(s.app_catalog_bundle_ids().unwrap(), ["com.apple.Music".to_string()].into());
+        // Its vector is gone too.
+        let after = s.search_app_catalog(&unit_vec(2), 5).unwrap();
+        assert!(after.iter().all(|(r, _)| r.bundle_id != "com.figma.Desktop"));
     }
 
     #[test]

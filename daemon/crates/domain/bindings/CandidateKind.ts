@@ -5,4 +5,4 @@
  * carry an already-materialized workspace, so staging/rehydration treat
  * every kind identically.
  */
-export type CandidateKind = "workspace" | "group" | "assembled";
+export type CandidateKind = "workspace" | "group" | "assembled" | "summoned";
