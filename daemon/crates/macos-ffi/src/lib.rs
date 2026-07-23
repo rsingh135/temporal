@@ -6,6 +6,7 @@
 
 pub mod ax;
 pub mod bundle;
+pub mod catalog;
 pub mod display;
 pub mod permissions;
 pub mod window_list;

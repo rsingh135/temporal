@@ -9,4 +9,10 @@ export type QueryCandidate = { workspace: WorkspaceState, score: number, kind: C
 /**
  * For Group candidates: the snapshot this group was carved from.
  */
-sourceWorkspaceId?: string | null, };
+sourceWorkspaceId?: string | null, 
+/**
+ * For Summoned candidates: node ids that are speculative launches (an app
+ * the catalog proposed opening, not observed running). The UI badges these
+ * in the staging preview so the user knows what will be newly opened.
+ */
+speculativeNodeIds?: Array<string>, };

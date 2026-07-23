@@ -210,6 +210,26 @@ body,
     opacity: 0.6;
 }
 
+/* Speculative launches (apps the summon proposes opening, not yet running). */
+.node.speculative {
+    background: rgba(120, 90, 220, 0.08);
+}
+
+.node.speculative .node-glyph {
+    opacity: 0.55;
+}
+
+.node-badge {
+    margin-left: 8px;
+    padding: 1px 6px;
+    border-radius: 6px;
+    font-size: 10px;
+    font-weight: 600;
+    vertical-align: middle;
+    color: #c9b6ff;
+    background: rgba(150, 120, 240, 0.18);
+}
+
 .footer {
     display: flex;
     justify-content: space-between;

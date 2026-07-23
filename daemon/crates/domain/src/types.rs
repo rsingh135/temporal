@@ -158,6 +158,10 @@ pub enum CandidateKind {
     Group,
     /// A virtual workspace assembled from cross-snapshot item search.
     Assembled,
+    /// A workspace synthesized for a stated intent from the live desktop,
+    /// history, and installed apps that *should* be open (some of whose nodes
+    /// are speculative launches — see `QueryCandidate::speculative_node_ids`).
+    Summoned,
 }
 
 /// One semantic search hit; score is cosine similarity in [0, 1].
@@ -172,6 +176,11 @@ pub struct QueryCandidate {
     /// For Group candidates: the snapshot this group was carved from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_workspace_id: Option<String>,
+    /// For Summoned candidates: node ids that are speculative launches (an app
+    /// the catalog proposed opening, not observed running). The UI badges these
+    /// in the staging preview so the user knows what will be newly opened.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speculative_node_ids: Vec<String>,
 }
 
 /// UI -> daemon requests over the Unix domain socket.
@@ -182,6 +191,10 @@ pub enum IpcRequest {
     Ping,
     Freeze,
     Query { text: String, limit: i32 },
+    /// Assemble a workspace for a stated intent from the live desktop, history,
+    /// and installed apps — a forward synthesis, not a retrieval of a past
+    /// snapshot. Responds with `QueryResults` (a `Summoned` candidate first).
+    SummonIntent { text: String },
     Rehydrate { payload: RehydrationPayload },
     /// Dry-run a rehydration: report per-node preflight without launching.
     RehydratePreview { payload: RehydrationPayload },

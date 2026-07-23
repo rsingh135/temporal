@@ -22,6 +22,8 @@ pub enum ProbeCommand {
         #[arg(long, default_value_t = 5)]
         limit: i32,
     },
+    /// Summon a workspace for a stated intent (live desktop + history + apps).
+    Summon { text: String },
     /// Rehydrate a stored workspace by id (no exclusions).
     Rehydrate { workspace_id: String },
     /// Screen Recording / Accessibility permission diagnostics.
@@ -69,6 +71,7 @@ pub async fn run_probe(socket_path: &Path, command: ProbeCommand) -> Result<()> 
         ProbeCommand::Query { text, limit } => {
             IpcRequest::Query { text: text.clone(), limit: *limit }
         }
+        ProbeCommand::Summon { text } => IpcRequest::SummonIntent { text: text.clone() },
         ProbeCommand::Rehydrate { workspace_id } => {
             let workspace = fetch_workspace(&mut stream, workspace_id).await?;
             IpcRequest::Rehydrate {

@@ -118,6 +118,33 @@ impl Tagger {
             .ok_or_else(|| SemanticError::Llm(format!("model returned unparseable labels: {raw}")))
     }
 
+    /// Infers which capabilities a stated intent needs, from a fixed
+    /// `vocabulary`. This is what lets Summon propose launching an app the user
+    /// hasn't opened ("work on the app UI" → ["design", …]). The reply is a set,
+    /// so a plain JSON array is safe here (unlike positional label lists, order
+    /// carries no meaning); output is lowercased and filtered to the vocabulary.
+    pub fn infer_capabilities(
+        &self,
+        intent: &str,
+        vocabulary: &[&str],
+    ) -> Result<Vec<String>, SemanticError> {
+        let intent: String = intent.chars().take(MAX_CONTEXT_CHARS).collect();
+        let vocab = vocabulary.join(", ");
+        let prompt = format!(
+            "<|im_start|>system\n\
+             The user states what they want to work on. Reply with ONLY a JSON array of the \
+             capabilities they will need, chosen strictly from this list: [{vocab}]. Include only \
+             what the intent clearly implies — an empty array [] if unsure. Never invent labels \
+             outside the list.\n\
+             Example: intent \"work on the app's UI\" -> [\"design\", \"editor\", \"browser\"] \
+             /no_think<|im_end|>\n\
+             <|im_start|>user\n{intent}<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        let raw = self.complete(&prompt)?;
+        Ok(parse_capabilities(&raw, vocabulary))
+    }
+
     fn complete(&self, prompt: &str) -> Result<String, SemanticError> {
         let llm = |e: &dyn std::fmt::Display| SemanticError::Llm(e.to_string());
         let backend = backend()?;
@@ -215,9 +242,44 @@ fn parse_labels(raw: &str, n: usize) -> Option<Vec<String>> {
         .collect()
 }
 
+/// Pulls the first JSON array out of the model output and keeps only entries
+/// that are in `vocabulary` (lowercased, deduped, order-preserved). Junk or a
+/// missing array yields an empty set — the caller then relies on embedding
+/// matches alone.
+fn parse_capabilities(raw: &str, vocabulary: &[&str]) -> Vec<String> {
+    let Some(start) = raw.find('[') else { return Vec::new() };
+    let Some(end) = raw[start..].find(']').map(|i| start + i) else { return Vec::new() };
+    let Ok(parsed) = serde_json::from_str::<Vec<String>>(&raw[start..=end]) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in parsed {
+        let label = entry.trim().to_lowercase();
+        if vocabulary.contains(&label.as_str()) && !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VOCAB: &[&str] = &["design", "editor", "browser", "terminal"];
+
+    #[test]
+    fn capabilities_filtered_to_vocabulary_and_deduped() {
+        let raw = "<think>\n</think>\n[\"Design\", \"editor\", \"editor\", \"telepathy\"]";
+        assert_eq!(parse_capabilities(raw, VOCAB), vec!["design", "editor"]);
+    }
+
+    #[test]
+    fn capabilities_empty_on_junk_or_missing_array() {
+        assert!(parse_capabilities("no array here", VOCAB).is_empty());
+        assert!(parse_capabilities("[]", VOCAB).is_empty());
+        assert!(parse_capabilities("[\"nonsense\"]", VOCAB).is_empty());
+    }
 
     #[test]
     fn parses_labels_wrapped_in_think_block_and_prose() {
