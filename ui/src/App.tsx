@@ -92,6 +92,7 @@ function CandidateRow(props: {
                 <span className="candidate-summary">
                     {kind === "group" && <span className="candidate-glyph">↳</span>}
                     {kind === "assembled" && <span className="candidate-glyph">✦</span>}
+                    {kind === "summoned" && <span className="candidate-glyph">✨</span>}
                     {w.summary}
                 </span>
                 <span className="candidate-meta">
@@ -108,6 +109,7 @@ function NodeRow(props: {
     node: WindowNode;
     excluded: boolean;
     focused: boolean;
+    speculative: boolean;
     preflight?: PreflightNode;
     onToggle: () => void;
 }) {
@@ -116,6 +118,7 @@ function NodeRow(props: {
         "node",
         props.excluded && "excluded",
         props.focused && "focused",
+        props.speculative && "speculative",
         issues.length > 0 && "has-issues",
     ]
         .filter(Boolean)
@@ -127,8 +130,11 @@ function NodeRow(props: {
             <div className="node-text">
                 <span className="node-title">
                     {props.node.appName} — {props.node.windowTitle}
+                    {props.speculative && <span className="node-badge">＋ will open</span>}
                 </span>
-                <span className="node-detail">{nodeDetail(props.node)}</span>
+                <span className="node-detail">
+                    {props.speculative ? "not currently running" : nodeDetail(props.node)}
+                </span>
                 {issues.map((issue, i) => (
                     <span className="node-issue" key={i}>
                         ⚠ {issue}
@@ -184,7 +190,14 @@ export function App() {
 
     const runQuery = (text: string) => {
         setSearching(true);
-        sendRequest({ type: "query", text, limit: 8 })
+        // Non-empty text is an intent: synthesize a workspace from the live
+        // desktop, history, and installed apps. Empty text browses recent
+        // snapshots (with their semantic sub-groups).
+        const request: IpcRequest =
+            text.trim() === ""
+                ? { type: "query", text: "", limit: 8 }
+                : { type: "summon-intent", text };
+        sendRequest(request)
             .then((responses) => {
                 setSearching(false);
                 const last = responses.at(-1);
@@ -430,6 +443,9 @@ export function App() {
                                 node={node}
                                 excluded={excluded.has(node.nodeId)}
                                 focused={i === stagingIndex}
+                                speculative={(phase.candidate.speculativeNodeIds ?? []).includes(
+                                    node.nodeId,
+                                )}
                                 preflight={preview.get(node.nodeId)}
                                 onToggle={() => toggleExcluded(node.nodeId)}
                             />
