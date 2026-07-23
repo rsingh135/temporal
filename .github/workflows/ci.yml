@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # macOS runner is required: the daemon links CoreGraphics / Accessibility /
+  # AppKit and builds llama.cpp with Metal. Mirrors build/check.sh (the trusted
+  # local gate) so CI parity is exact. fmt is intentionally not gated: the tree
+  # uses a compact hand-style that default rustfmt would churn.
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      # rust-toolchain.toml pins the compiler + clippy component; rustup honors
+      # it automatically. This step just makes the install eager and cached.
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            daemon
+            ui/src-tauri
+
+      - name: Generate TS bindings
+        run: build/ts-gen.sh
+
+      - name: Daemon build
+        working-directory: daemon
+        run: cargo build --workspace
+
+      - name: Daemon clippy (strict)
+        working-directory: daemon
+        run: cargo clippy --workspace --no-deps -- -D warnings
+
+      # Model-dependent E2E tests self-skip when the ~2GB models are absent, so
+      # this stays green without downloading them.
+      - name: Daemon tests
+        working-directory: daemon
+        run: cargo test --workspace
+
+      - name: UI install
+        working-directory: ui
+        run: npm ci
+
+      - name: UI typecheck + build
+        working-directory: ui
+        run: npx tsc --noEmit && npm run build
+
+      - name: Tauri shell build
+        working-directory: ui/src-tauri
+        run: cargo build
+
+      - name: Tauri shell clippy (strict)
+        working-directory: ui/src-tauri
+        run: cargo clippy --no-deps -- -D warnings
+
+  # Supply-chain: security advisories, license policy, unknown sources.
+  # Runs on Linux (no macOS build needed to inspect the dependency graph).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: daemon/Cargo.toml
+          command: check advisories licenses sources bans

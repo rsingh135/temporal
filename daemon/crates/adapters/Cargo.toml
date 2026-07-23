@@ -3,12 +3,13 @@ name = "temporal-adapters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 temporal-macos-ffi = { path = "../macos-ffi" }
 temporal-domain = { path = "../domain" }
 # serde_json here parses osascript/storage.json TOOL OUTPUT only; the IPC/DB
-# wire format remains exclusively the shared F# codec.
+# wire format remains exclusively the shared serde codec in temporal-domain.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 percent-encoding = "2"

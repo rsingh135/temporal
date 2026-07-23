@@ -3,6 +3,7 @@ name = "temporal-macos-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 objc2-core-foundation = "0.3"

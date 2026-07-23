@@ -3,6 +3,7 @@ name = "temporal-semantic"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }

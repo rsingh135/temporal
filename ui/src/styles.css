@@ -198,6 +198,18 @@ body,
     text-overflow: ellipsis;
 }
 
+.node-issue {
+    font-size: 11px;
+    color: #e0a94a;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.node.has-issues .node-glyph {
+    opacity: 0.6;
+}
+
 .footer {
     display: flex;
     justify-content: space-between;

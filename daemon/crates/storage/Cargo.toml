@@ -3,6 +3,7 @@ name = "temporal-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }

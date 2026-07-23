@@ -13,7 +13,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::json;
-use temporal_domain::{BrowserTab, NodePayload, TerminalTab, WindowGeometry, WindowNode};
+use temporal_domain::{
+    BrowserTab, NodePayload, PreflightNode, TerminalTab, WindowGeometry, WindowNode,
+};
 use tracing::{info, warn};
 
 use crate::osascript::run_jxa_json_retrying;
@@ -21,6 +23,46 @@ use crate::proc_timeout;
 
 const MDFIND_TIMEOUT: Duration = Duration::from_secs(3);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// URL schemes Chrome is allowed to reopen. The rehydration payload arrives
+/// over the socket and is not validated against storage, so a client could
+/// otherwise ask Chrome to open `file://`, `javascript:`, or `data:` URLs.
+const ALLOWED_URL_SCHEMES: &[&str] = &["http", "https", "chrome", "chrome-extension", "about"];
+
+/// Extracts the lowercased URI scheme per RFC 3986
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` up to the first `:`), or
+/// `None` if the string doesn't start with a valid scheme. Deliberately does
+/// not trim leading whitespace: a leading space means no scheme, so a
+/// `" javascript:"` smuggling attempt is rejected rather than normalized.
+fn uri_scheme(url: &str) -> Option<String> {
+    let (scheme, _rest) = url.split_once(':')?;
+    let mut chars = scheme.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return None;
+    }
+    Some(scheme.to_ascii_lowercase())
+}
+
+/// True if `url` has an allowlisted scheme safe for Chrome to reopen.
+fn is_allowed_url(url: &str) -> bool {
+    uri_scheme(url).is_some_and(|s| ALLOWED_URL_SCHEMES.contains(&s.as_str()))
+}
+
+/// True if `s` has the shape of a macOS bundle identifier (reverse-DNS:
+/// alphanumerics, dots, and hyphens, containing at least one dot, not starting
+/// with `-`). Rejects flag-injection-shaped strings (`-x`) and quote characters
+/// that would break the `mdfind`/`open` argument, without hardcoding an app
+/// allowlist — the generic adapter can still launch any legitimately-shaped id.
+fn looks_like_bundle_id(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.contains('.')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
 
 /// Per-node outcome; failures don't abort the rest of the payload.
 pub struct RehydrationOutcome {
@@ -67,6 +109,52 @@ pub fn rehydrate_nodes(nodes: &[WindowNode], mut on_event: impl FnMut(NodeEvent)
     outcome
 }
 
+/// Dry-runs rehydration for each node: reports whether the app looks installed,
+/// whether the window would be repositioned, and how many tabs would be skipped
+/// — without launching anything. Uses the same predicates as the real
+/// rehydration so the preview matches the outcome.
+pub fn preflight_nodes(nodes: &[WindowNode]) -> Vec<PreflightNode> {
+    nodes.iter().map(preflight_node).collect()
+}
+
+fn preflight_node(node: &WindowNode) -> PreflightNode {
+    let installed = looks_like_bundle_id(&node.bundle_id) && bundle_is_installed(&node.bundle_id);
+
+    let (cx, cy, cw, ch) = clamped_frame(node);
+    let g = &node.geometry;
+    let geometry_clamped = (cx, cy, cw, ch) != (g.x, g.y, g.width, g.height);
+
+    let (total_tabs, skipped_tabs) = match &node.payload {
+        NodePayload::Browser { tabs, .. } => (
+            tabs.len(),
+            tabs.iter().filter(|t| !is_allowed_url(&t.url)).count(),
+        ),
+        _ => (0, 0),
+    };
+
+    let mut issues = Vec::new();
+    if !installed {
+        issues.push(format!("{} is not installed — will be skipped", node.app_name));
+    }
+    if geometry_clamped {
+        issues.push("window will be repositioned onto an active display".to_string());
+    }
+    if skipped_tabs > 0 {
+        issues.push(format!("{skipped_tabs} tab(s) with a disallowed URL scheme will be skipped"));
+    }
+
+    PreflightNode {
+        node_id: node.node_id.clone(),
+        app_name: node.app_name.clone(),
+        adapter: node.adapter,
+        installed,
+        geometry_clamped,
+        total_tabs: total_tabs as u32,
+        skipped_tabs: skipped_tabs as u32,
+        issues,
+    }
+}
+
 /// Clamps a captured node's geometry to fit within a currently active
 /// display; a captured window on a monitor that's since been unplugged would
 /// otherwise be restored off-screen.
@@ -85,7 +173,9 @@ fn rehydrate_node(node: &WindowNode) -> Result<(), String> {
             rehydrate_chrome(node, tabs, *active_tab_index)
         }
         NodePayload::Terminal { tabs } => rehydrate_terminal(node, tabs),
-        NodePayload::Editor { folder_path, .. } => rehydrate_editor(node, folder_path),
+        NodePayload::Editor { folder_path, open_files } => {
+            rehydrate_editor(node, folder_path, open_files)
+        }
         NodePayload::Generic => rehydrate_generic(node),
     }
 }
@@ -98,10 +188,26 @@ fn rehydrate_chrome(
     if tabs.is_empty() {
         return Ok(());
     }
+    // Drop tabs whose URL scheme isn't allowlisted; keep restoring the rest.
+    let total = tabs.len();
+    let urls: Vec<String> = tabs
+        .iter()
+        .filter(|t| {
+            let ok = is_allowed_url(&t.url);
+            if !ok {
+                warn!(url = %t.url, node = %node.node_id, "skipping tab with disallowed URL scheme");
+            }
+            ok
+        })
+        .map(|t| t.url.clone())
+        .collect();
+    if urls.is_empty() {
+        return Err(format!("all {total} tab(s) had a disallowed URL scheme"));
+    }
     let (x, y, width, height) = clamped_frame(node);
     // Data goes in as JSON so URLs never touch script-string escaping.
     let data = json!({
-        "urls": tabs.iter().map(|t| t.url.clone()).collect::<Vec<_>>(),
+        "urls": urls,
         "active": active_tab_index + 1, // JXA tab indices are 1-based
         "bounds": { "x": x, "y": y, "width": width, "height": height },
     });
@@ -153,18 +259,47 @@ JSON.stringify("ok");
     Ok(())
 }
 
-fn rehydrate_editor(node: &WindowNode, folder_path: &str) -> Result<(), String> {
+fn rehydrate_editor(
+    node: &WindowNode,
+    folder_path: &str,
+    open_files: &[String],
+) -> Result<(), String> {
+    // `--` stops `open` from parsing a folder_path that begins with `-` as a
+    // flag (no shell is involved, so this is argument-injection hardening only).
     let status = Command::new("/usr/bin/open")
-        .args(["-a", &node.app_name, folder_path])
+        .args(["-a", &node.app_name, "--", folder_path])
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!("open -a {} exited with {status}", node.app_name));
     }
+    // Reopen the previously-open files in the just-restored window. `-g` keeps
+    // the editor from stealing focus per file; VS Code / Cursor add each file
+    // to the folder's window. Best-effort: a failure here doesn't fail the node
+    // (the folder is already open), it's just logged.
+    if !open_files.is_empty() {
+        let mut cmd = Command::new("/usr/bin/open");
+        cmd.args(["-a", &node.app_name, "-g", "--"]);
+        cmd.args(open_files);
+        match proc_timeout::run_with_timeout(cmd, OPEN_TIMEOUT) {
+            Ok(output) if !output.status.success() => {
+                warn!(
+                    app = %node.app_name,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "reopening editor files failed"
+                );
+            }
+            Err(e) => warn!(app = %node.app_name, error = %e, "reopening editor files failed"),
+            Ok(_) => {}
+        }
+    }
     Ok(())
 }
 
 fn rehydrate_generic(node: &WindowNode) -> Result<(), String> {
+    if !looks_like_bundle_id(&node.bundle_id) {
+        return Err(format!("{:?} is not a valid bundle id", node.bundle_id));
+    }
     if !bundle_is_installed(&node.bundle_id) {
         return Err(format!("{} is not installed", node.bundle_id));
     }
@@ -212,4 +347,56 @@ fn pid_for_bundle(bundle_id: &str) -> Option<i32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_scheme_extracts_and_lowercases() {
+        assert_eq!(uri_scheme("HTTPS://example.com").as_deref(), Some("https"));
+        assert_eq!(uri_scheme("chrome-extension://abc/x").as_deref(), Some("chrome-extension"));
+    }
+
+    #[test]
+    fn uri_scheme_rejects_no_or_malformed_scheme() {
+        assert_eq!(uri_scheme("example.com/path"), None); // no colon
+        assert_eq!(uri_scheme(" javascript:alert(1)"), None); // leading space, no valid scheme
+        assert_eq!(uri_scheme("1http://x"), None); // scheme must start with a letter
+        assert_eq!(uri_scheme("//host/path"), None);
+    }
+
+    #[test]
+    fn allowed_url_permits_web_and_chrome_schemes() {
+        assert!(is_allowed_url("https://example.com"));
+        assert!(is_allowed_url("http://example.com"));
+        assert!(is_allowed_url("chrome://newtab"));
+        assert!(is_allowed_url("about:blank"));
+    }
+
+    #[test]
+    fn allowed_url_rejects_dangerous_schemes() {
+        assert!(!is_allowed_url("file:///etc/passwd"));
+        assert!(!is_allowed_url("javascript:alert(1)"));
+        assert!(!is_allowed_url("data:text/html,<script>x</script>"));
+        assert!(!is_allowed_url(" javascript:alert(1)"));
+        assert!(!is_allowed_url("example.com")); // no scheme at all
+    }
+
+    #[test]
+    fn looks_like_bundle_id_accepts_real_ids() {
+        assert!(looks_like_bundle_id("com.google.Chrome"));
+        assert!(looks_like_bundle_id("com.todesktop.230313mzl4w4u92"));
+        assert!(looks_like_bundle_id("com.apple.Terminal"));
+    }
+
+    #[test]
+    fn looks_like_bundle_id_rejects_injection_shapes() {
+        assert!(!looks_like_bundle_id("")); // empty
+        assert!(!looks_like_bundle_id("-a")); // flag shape
+        assert!(!looks_like_bundle_id("noDotHere")); // not reverse-DNS
+        assert!(!looks_like_bundle_id("com.evil'; rm -rf")); // quote + space
+        assert!(!looks_like_bundle_id("com.foo bar")); // space
+    }
 }

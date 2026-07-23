@@ -10,12 +10,117 @@ use temporal_domain::wire::{
     request_from_wire, response_to_wire, tags_to_wire, workspace_from_wire, workspace_to_wire,
 };
 use temporal_domain::{
-    grouping, planning, tagging, CandidateKind, IpcRequest, IpcResponse, QueryCandidate,
-    RehydrationPayload, WorkspaceState,
+    grouping, planning, tagging, CandidateKind, IpcRequest, IpcResponse, NodePayload,
+    QueryCandidate, RehydrationPayload, WorkspaceState,
 };
 use temporal_ipc::{Handler, Responder};
 use temporal_storage::{ItemRecord, Storage, WorkspaceRecord};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Watches a detached `spawn_blocking` task and logs if it *panicked* — the
+/// tasks log their own returned errors, but a panic would otherwise vanish
+/// silently because the JoinHandle is dropped.
+fn supervise(handle: tokio::task::JoinHandle<()>, name: &'static str) {
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            error!(task = name, error = %e, "detached task panicked");
+        }
+    });
+}
+
+/// Upper bounds on a rehydration payload. A real desktop is a few dozen
+/// windows with a few dozen tabs each; these are generous but reject
+/// pathological client payloads before any subprocess/JXA work.
+const MAX_REHYDRATE_NODES: usize = 200;
+const MAX_TABS_PER_NODE: usize = 500;
+
+/// Rejects an oversized rehydration payload. Content is not otherwise
+/// validated — see the trust-boundary note in SECURITY.md.
+fn validate_payload_size(payload: &RehydrationPayload) -> Result<(), String> {
+    let nodes = &payload.workspace.nodes;
+    if nodes.len() > MAX_REHYDRATE_NODES {
+        return Err(format!(
+            "payload has {} nodes; maximum is {MAX_REHYDRATE_NODES}",
+            nodes.len()
+        ));
+    }
+    for node in nodes {
+        let tabs = match &node.payload {
+            NodePayload::Browser { tabs, .. } => tabs.len(),
+            NodePayload::Terminal { tabs } => tabs.len(),
+            NodePayload::Editor { .. } | NodePayload::Generic => 0,
+        };
+        if tabs > MAX_TABS_PER_NODE {
+            return Err(format!(
+                "node {:?} has {tabs} tabs; maximum is {MAX_TABS_PER_NODE}",
+                node.node_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How many most-recent snapshots the scheduled auto-freeze retains; older ones
+/// are pruned after each capture so passive freezing can't grow the DB forever.
+// Used by the binary (main.rs). The integration tests include this file via
+// `#[path]` without main.rs, so allow the false "unused" there.
+#[allow(dead_code)]
+const AUTO_FREEZE_KEEP: usize = 100;
+
+/// Distinguishes a task/join failure (E_INTERNAL) from a storage failure
+/// (E_STORAGE) so the freeze path keeps its original error codes after being
+/// shared between the interactive and scheduled callers.
+enum FreezeError {
+    Internal(tokio::task::JoinError),
+    Storage(anyhow::Error),
+}
+
+/// Persists a captured workspace: builds semantic groups + item vectors (when
+/// an embedder is present), writes the record, its embedding, and its items.
+/// Runs inside `spawn_blocking`.
+fn persist_workspace(
+    storage: Arc<Storage>,
+    embedder: Option<SharedEmbedder>,
+    mut workspace: WorkspaceState,
+) -> anyhow::Result<()> {
+    // Groups must exist before the record is built: they live inside
+    // payload_json. Item vectors land alongside for prompt assembly.
+    let mut item_rows: Vec<(ItemRecord, Vec<f32>)> = Vec::new();
+    if let Some(embedder) = &embedder {
+        let items = grouping::items_for(&workspace);
+        let mut guard = embedder.lock().expect("embedder mutex poisoned");
+        let mut vectors = Vec::with_capacity(items.len());
+        for item in &items {
+            vectors.push(guard.embed_document(&item.embed_text)?);
+        }
+        drop(guard);
+        workspace.groups = grouping::build_groups(&items, &vectors);
+        item_rows = items
+            .iter()
+            .zip(vectors)
+            .map(|(item, vector)| {
+                (item_record(&workspace.workspace_id, workspace.captured_at_unix_ms, item), vector)
+            })
+            .collect();
+    }
+    let record = WorkspaceRecord {
+        workspace_id: workspace.workspace_id.clone(),
+        captured_at_unix_ms: workspace.captured_at_unix_ms,
+        summary: workspace.summary.clone(),
+        tags_json: tags_to_wire(&workspace),
+        payload_json: workspace_to_wire(&workspace),
+    };
+    storage.upsert_workspace(&record)?;
+    if let Some(embedder) = &embedder {
+        let vector = embedder
+            .lock()
+            .expect("embedder mutex poisoned")
+            .embed_document(&tagging::embedding_text(&workspace))?;
+        storage.upsert_embedding(&workspace.workspace_id, &vector)?;
+        storage.replace_items(&workspace.workspace_id, &item_rows)?;
+    }
+    Ok(())
+}
 
 /// The ort session is not Sync; a std Mutex serializes embeddings (they take
 /// ~10ms and happen once per freeze/query).
@@ -53,37 +158,60 @@ impl DaemonHandler {
     }
 
     async fn handle_freeze(&self, responder: Responder) {
+        match self.freeze_core(Some(&responder)).await {
+            Ok((workspace_id, node_count)) => {
+                Self::respond(
+                    &responder,
+                    IpcResponse::Done {
+                        message: format!("froze workspace {workspace_id} ({node_count} windows)"),
+                    },
+                )
+                .await;
+            }
+            Err(FreezeError::Storage(e)) => Self::error(&responder, "E_STORAGE", e).await,
+            Err(FreezeError::Internal(e)) => Self::error(&responder, "E_INTERNAL", e).await,
+        }
+    }
+
+    /// Captures the desktop and persists it, returning `(workspace_id,
+    /// node_count)`. Shared by the interactive `Freeze` IPC (which passes a
+    /// responder to stream FreezeStarted/Progress) and the scheduled
+    /// auto-freeze (which passes `None`). Spawns detached LLM enrichment on
+    /// success so the freeze itself stays fast.
+    async fn freeze_core(&self, progress: Option<&Responder>) -> Result<(String, usize), FreezeError> {
         let workspace_id = format!("ws-{}", uuid::Uuid::new_v4());
         let now_ms = unix_ms();
-        Self::respond(&responder, IpcResponse::FreezeStarted { workspace_id: workspace_id.clone() })
+        if let Some(r) = progress {
+            Self::respond(r, IpcResponse::FreezeStarted { workspace_id: workspace_id.clone() }).await;
+            Self::respond(
+                r,
+                IpcResponse::Progress {
+                    stage: "extract".into(),
+                    detail: "desktop state".into(),
+                    percent: 10,
+                },
+            )
             .await;
-        Self::respond(
-            &responder,
-            IpcResponse::Progress {
-                stage: "extract".into(),
-                detail: "desktop state".into(),
-                percent: 10,
-            },
-        )
-        .await;
+        }
 
-        let report = match tokio::task::spawn_blocking(temporal_adapters::extract_workspace).await {
-            Ok(report) => report,
-            Err(join_err) => return Self::error(&responder, "E_INTERNAL", join_err).await,
-        };
+        let report = tokio::task::spawn_blocking(temporal_adapters::extract_workspace)
+            .await
+            .map_err(FreezeError::Internal)?;
         for warning in &report.warnings {
             warn!(warning, "extraction warning");
         }
         let node_count = report.nodes.len();
-        Self::respond(
-            &responder,
-            IpcResponse::Progress {
-                stage: "tag".into(),
-                detail: format!("{node_count} windows captured"),
-                percent: 60,
-            },
-        )
-        .await;
+        if let Some(r) = progress {
+            Self::respond(
+                r,
+                IpcResponse::Progress {
+                    stage: "tag".into(),
+                    detail: format!("{node_count} windows captured"),
+                    percent: 60,
+                },
+            )
+            .await;
+        }
 
         let workspace = tagging::enrich(WorkspaceState {
             workspace_id: workspace_id.clone(),
@@ -94,73 +222,50 @@ impl DaemonHandler {
             groups: Vec::new(),
         });
 
-        Self::respond(
-            &responder,
-            IpcResponse::Progress { stage: "persist".into(), detail: String::new(), percent: 90 },
-        )
-        .await;
+        if let Some(r) = progress {
+            Self::respond(
+                r,
+                IpcResponse::Progress { stage: "persist".into(), detail: String::new(), percent: 90 },
+            )
+            .await;
+        }
         let storage = Arc::clone(&self.storage);
         let embedder = self.embedder.clone();
-        let stored = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            // Groups must exist before the record is built: they live inside
-            // payload_json. Item vectors land alongside for prompt assembly.
-            let mut workspace = workspace;
-            let mut item_rows: Vec<(ItemRecord, Vec<f32>)> = Vec::new();
-            if let Some(embedder) = &embedder {
-                let items = grouping::items_for(&workspace);
-                let mut guard = embedder.lock().expect("embedder mutex poisoned");
-                let mut vectors = Vec::with_capacity(items.len());
-                for item in &items {
-                    vectors.push(guard.embed_document(&item.embed_text)?);
+        tokio::task::spawn_blocking(move || persist_workspace(storage, embedder, workspace))
+            .await
+            .map_err(FreezeError::Internal)?
+            .map_err(FreezeError::Storage)?;
+
+        info!(workspace_id, node_count, "workspace frozen");
+        // LLM enrichment runs detached: the freeze stays instant and the record
+        // upgrades in place when generation finishes.
+        self.spawn_llm_enrichment(workspace_id.clone());
+        Ok((workspace_id, node_count))
+    }
+
+    /// One scheduled capture: freeze silently, then bound DB growth by keeping
+    /// only the most recent snapshots. All failures log and are swallowed so
+    /// the timer loop keeps running.
+    // Called by the binary's interval loop; see the AUTO_FREEZE_KEEP note.
+    #[allow(dead_code)]
+    pub async fn auto_freeze(&self) {
+        match self.freeze_core(None).await {
+            Ok((workspace_id, node_count)) => {
+                info!(workspace_id, node_count, "auto-freeze stored");
+                let storage = Arc::clone(&self.storage);
+                match tokio::task::spawn_blocking(move || storage.prune_keep_latest(AUTO_FREEZE_KEEP))
+                    .await
+                {
+                    Ok(Ok(removed)) if removed > 0 => {
+                        info!(removed, "auto-freeze pruned old snapshots")
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => warn!(error = %e, "auto-freeze prune failed"),
+                    Err(e) => warn!(error = %e, "auto-freeze prune task panicked"),
                 }
-                drop(guard);
-                workspace.groups = grouping::build_groups(&items, &vectors);
-                item_rows = items
-                    .iter()
-                    .zip(vectors)
-                    .map(|(item, vector)| {
-                        (
-                            item_record(&workspace.workspace_id, workspace.captured_at_unix_ms, item),
-                            vector,
-                        )
-                    })
-                    .collect();
             }
-            let record = WorkspaceRecord {
-                workspace_id: workspace.workspace_id.clone(),
-                captured_at_unix_ms: workspace.captured_at_unix_ms,
-                summary: workspace.summary.clone(),
-                tags_json: tags_to_wire(&workspace),
-                payload_json: workspace_to_wire(&workspace),
-            };
-            storage.upsert_workspace(&record)?;
-            if let Some(embedder) = &embedder {
-                let vector = embedder
-                    .lock()
-                    .expect("embedder mutex poisoned")
-                    .embed_document(&tagging::embedding_text(&workspace))?;
-                storage.upsert_embedding(&workspace.workspace_id, &vector)?;
-                storage.replace_items(&workspace.workspace_id, &item_rows)?;
-            }
-            Ok(())
-        })
-        .await;
-        match stored {
-            Ok(Ok(())) => {
-                info!(workspace_id, node_count, "workspace frozen");
-                Self::respond(
-                    &responder,
-                    IpcResponse::Done {
-                        message: format!("froze workspace {workspace_id} ({node_count} windows)"),
-                    },
-                )
-                .await;
-                // LLM enrichment runs after Done: the freeze stays instant and
-                // the record upgrades in place when generation finishes.
-                self.spawn_llm_enrichment(workspace_id);
-            }
-            Ok(Err(e)) => Self::error(&responder, "E_STORAGE", e).await,
-            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
+            Err(FreezeError::Storage(e)) => warn!(error = %e, "auto-freeze failed"),
+            Err(FreezeError::Internal(e)) => warn!(error = %e, "auto-freeze task panicked"),
         }
     }
 
@@ -170,7 +275,7 @@ impl DaemonHandler {
         let Some(tagger) = self.tagger.clone() else { return };
         let storage = Arc::clone(&self.storage);
         let embedder = self.embedder.clone();
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             let run = || -> anyhow::Result<()> {
                 let Some(record) = storage.get_workspace(&workspace_id)? else {
                     return Ok(()); // deleted/overwritten in the meantime
@@ -234,6 +339,7 @@ impl DaemonHandler {
                 warn!(error = %e, "llm enrichment failed; heuristic tags kept");
             }
         });
+        supervise(handle, "llm enrichment");
     }
 
     async fn handle_query(&self, text: String, limit: i32, responder: Responder) {
@@ -254,6 +360,13 @@ impl DaemonHandler {
     }
 
     async fn handle_rehydrate(&self, payload: RehydrationPayload, responder: Responder) {
+        // The payload is client-supplied and not checked against storage
+        // (synthesized Group/Assembled candidates never persist verbatim), so
+        // cap its size to bound resource use / JXA-script generation before any
+        // work. The real trust boundary is the owner-only socket (see SECURITY.md).
+        if let Err(msg) = validate_payload_size(&payload) {
+            return Self::error(&responder, "E_INVALID", msg).await;
+        }
         Self::respond(&responder, IpcResponse::RehydrateStarted).await;
         let nodes = planning::included_nodes(&payload.workspace, &payload.excluded_node_ids);
         let total = nodes.len();
@@ -292,6 +405,20 @@ impl DaemonHandler {
                 info!(restored = outcome.restored, failures = outcome.failures.len(), "rehydration finished");
                 Self::respond(&responder, IpcResponse::Done { message }).await;
             }
+            Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
+        }
+    }
+
+    async fn handle_rehydrate_preview(&self, payload: RehydrationPayload, responder: Responder) {
+        if let Err(msg) = validate_payload_size(&payload) {
+            return Self::error(&responder, "E_INVALID", msg).await;
+        }
+        let nodes = planning::included_nodes(&payload.workspace, &payload.excluded_node_ids);
+        let previewed =
+            tokio::task::spawn_blocking(move || temporal_adapters::rehydrate::preflight_nodes(&nodes))
+                .await;
+        match previewed {
+            Ok(nodes) => Self::respond(&responder, IpcResponse::RehydratePreview { nodes }).await,
             Err(join_err) => Self::error(&responder, "E_INTERNAL", join_err).await,
         }
     }
@@ -347,6 +474,9 @@ impl DaemonHandler {
             IpcRequest::Freeze => self.handle_freeze(responder).await,
             IpcRequest::Query { text, limit } => self.handle_query(text, limit, responder).await,
             IpcRequest::Rehydrate { payload } => self.handle_rehydrate(payload, responder).await,
+            IpcRequest::RehydratePreview { payload } => {
+                self.handle_rehydrate_preview(payload, responder).await
+            }
             IpcRequest::PermissionStatus => self.handle_permission_status(responder).await,
             IpcRequest::Prune { older_than_unix_ms, keep_latest } => {
                 self.handle_prune(older_than_unix_ms, keep_latest, responder).await
@@ -376,8 +506,11 @@ pub fn unix_ms() -> i64 {
 /// indexing existed into items + groups, so old snapshots show groups on the
 /// main menu and participate in prompt assembly. Per-workspace failures only
 /// log; freezes maintain items inline from here on.
+// Called by the binary (main.rs); the `#[path]` integration-test include
+// compiles this file without main.rs, so allow the false "unused" there.
+#[allow(dead_code)]
 pub fn spawn_item_backfill(storage: Arc<Storage>, embedder: SharedEmbedder) {
-    tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         let ids = match storage.workspace_ids_missing_items() {
             Ok(ids) => ids,
             Err(e) => {
@@ -430,6 +563,7 @@ pub fn spawn_item_backfill(storage: Arc<Storage>, embedder: SharedEmbedder) {
         }
         info!("item backfill complete");
     });
+    supervise(handle, "item backfill");
 }
 
 /// How many raw item hits to pull before dedup/thresholding.
@@ -625,5 +759,60 @@ fn decode_payload(record: &WorkspaceRecord) -> Option<WorkspaceState> {
             warn!(workspace_id = %record.workspace_id, error = %e, "stored payload failed to decode");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temporal_domain::{
+        AdapterKind, BrowserTab, RehydrationPayload, WindowGeometry, WindowNode, WorkspaceState,
+    };
+
+    fn browser_node(id: &str, tab_count: usize) -> WindowNode {
+        WindowNode {
+            node_id: id.into(),
+            bundle_id: "com.google.Chrome".into(),
+            app_name: "Google Chrome".into(),
+            window_title: String::new(),
+            geometry: WindowGeometry::default(),
+            adapter: AdapterKind::Chrome,
+            payload: NodePayload::Browser {
+                tabs: vec![BrowserTab { url: "https://x".into(), title: String::new() }; tab_count],
+                active_tab_index: 0,
+            },
+        }
+    }
+
+    fn payload(nodes: Vec<WindowNode>) -> RehydrationPayload {
+        RehydrationPayload {
+            workspace: WorkspaceState {
+                workspace_id: "w".into(),
+                captured_at_unix_ms: 0,
+                summary: String::new(),
+                tags: Vec::new(),
+                nodes,
+                groups: Vec::new(),
+            },
+            excluded_node_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_a_normal_payload() {
+        let nodes = (0..10).map(|i| browser_node(&i.to_string(), 20)).collect();
+        assert!(validate_payload_size(&payload(nodes)).is_ok());
+    }
+
+    #[test]
+    fn rejects_too_many_nodes() {
+        let nodes = (0..MAX_REHYDRATE_NODES + 1).map(|i| browser_node(&i.to_string(), 0)).collect();
+        assert!(validate_payload_size(&payload(nodes)).is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_tabs_in_one_node() {
+        let node = browser_node("big", MAX_TABS_PER_NODE + 1);
+        assert!(validate_payload_size(&payload(vec![node])).is_err());
     }
 }

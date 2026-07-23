@@ -121,6 +121,29 @@ pub struct RehydrationPayload {
     pub excluded_node_ids: Vec<String>,
 }
 
+/// Per-node dry-run of what rehydration would do, without launching anything.
+/// Lets the UI warn about apps that vanished, windows that will be moved, and
+/// tabs that will be skipped before the user commits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PreflightNode {
+    pub node_id: String,
+    pub app_name: String,
+    pub adapter: AdapterKind,
+    /// Whether the owning app appears installed (Spotlight-resolvable bundle id).
+    pub installed: bool,
+    /// Whether the captured window would be repositioned to fit an active
+    /// display (e.g. its original monitor is unplugged).
+    pub geometry_clamped: bool,
+    /// Browser tabs captured vs. tabs that will be skipped for a disallowed URL
+    /// scheme; both zero for non-browser nodes.
+    pub total_tabs: u32,
+    pub skipped_tabs: u32,
+    /// Human-readable notes for anything the user should know before committing.
+    pub issues: Vec<String>,
+}
+
 /// What a query candidate represents. `Group` and `Assembled` candidates
 /// carry an already-materialized workspace, so staging/rehydration treat
 /// every kind identically.
@@ -160,6 +183,8 @@ pub enum IpcRequest {
     Freeze,
     Query { text: String, limit: i32 },
     Rehydrate { payload: RehydrationPayload },
+    /// Dry-run a rehydration: report per-node preflight without launching.
+    RehydratePreview { payload: RehydrationPayload },
     /// Screen Recording / Accessibility permission check.
     PermissionStatus,
     /// Delete old workspace records. Exactly one field should be set.
@@ -180,6 +205,8 @@ pub enum IpcResponse {
     FreezeStarted { workspace_id: String },
     QueryResults { candidates: Vec<QueryCandidate> },
     RehydrateStarted,
+    /// Result of a RehydratePreview: what each included node would do.
+    RehydratePreview { nodes: Vec<PreflightNode> },
     Progress { stage: String, detail: String, percent: i32 },
     /// One rehydrated node's outcome, streamed as each node finishes.
     NodeResult { node_id: String, app_name: String, ok: bool, message: Option<String> },

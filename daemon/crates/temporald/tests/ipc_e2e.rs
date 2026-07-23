@@ -59,6 +59,7 @@ async fn roundtrip(stream: &mut UnixStream, request: IpcRequest) -> Vec<IpcRespo
                 | IpcResponse::Error { .. }
                 | IpcResponse::QueryResults { .. }
                 | IpcResponse::PermissionStatus { .. }
+                | IpcResponse::RehydratePreview { .. }
         );
         responses.push(response);
         if terminal {
@@ -149,6 +150,46 @@ async fn prune_rejects_ambiguous_request() {
         roundtrip(&mut stream, IpcRequest::Prune { older_than_unix_ms: None, keep_latest: None })
             .await;
     assert!(matches!(responses.last().unwrap(), IpcResponse::Error { .. }));
+}
+
+#[tokio::test]
+async fn rehydrate_preview_reports_a_node_per_included_node() {
+    use temporal_domain::{
+        AdapterKind, NodePayload, RehydrationPayload, WindowGeometry, WindowNode, WorkspaceState,
+    };
+    let daemon = start_daemon().await;
+    let mut stream = UnixStream::connect(&daemon.socket_path).await.expect("connect");
+
+    let node = WindowNode {
+        node_id: "n1".into(),
+        bundle_id: "com.apple.Terminal".into(),
+        app_name: "Terminal".into(),
+        window_title: String::new(),
+        geometry: WindowGeometry::default(),
+        adapter: AdapterKind::Generic,
+        payload: NodePayload::Generic,
+    };
+    let payload = RehydrationPayload {
+        workspace: WorkspaceState {
+            workspace_id: "w".into(),
+            captured_at_unix_ms: 0,
+            summary: String::new(),
+            tags: Vec::new(),
+            nodes: vec![node],
+            groups: Vec::new(),
+        },
+        excluded_node_ids: Vec::new(),
+    };
+
+    // Preview never launches anything, so this is safe to run in CI.
+    let responses = roundtrip(&mut stream, IpcRequest::RehydratePreview { payload }).await;
+    match responses.last().unwrap() {
+        IpcResponse::RehydratePreview { nodes } => {
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].node_id, "n1");
+        }
+        other => panic!("expected RehydratePreview, got {other:?}"),
+    }
 }
 
 #[tokio::test]
